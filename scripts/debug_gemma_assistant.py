@@ -88,6 +88,7 @@ def main() -> int:
     asst_text = asst_cfg.get_text_config() if hasattr(asst_cfg, "get_text_config") else asst_cfg
     log(f"  target  hidden_size      = {getattr(tgt_text, 'hidden_size', '?')}")
     log(f"  target  num_hidden_layers= {getattr(tgt_text, 'num_hidden_layers', '?')}")
+    log(f"  target  num_kv_shared    = {getattr(tgt_text, 'num_kv_shared_layers', '?')}")
     log(f"  target  layer_types      = {getattr(tgt_text, 'layer_types', '?')}")
     log(f"  assist  hidden_size      = {getattr(asst_text, 'hidden_size', '?')}")
     log(f"  assist  num_hidden_layers= {getattr(asst_text, 'num_hidden_layers', '?')}")
@@ -124,21 +125,45 @@ def main() -> int:
 
     # --- 3. Target forward: get hidden states + shared_kv_states -------------
     log("=== 3. Target forward (base model) ===")
-    with torch.no_grad():
-        tgt_out = target_base(
-            input_ids=enc["input_ids"],
-            attention_mask=enc.get("attention_mask"),
-            output_hidden_states=True,
-            use_cache=True,
-        )
+    # KEY: shared_kv_states is only returned when return_shared_kv_states=True.
+    # Gemma4TextModel.forward (transformers v5.10.2, line ~1735):
+    #   shared_kv_states = shared_kv_states if kwargs.get(
+    #       "return_shared_kv_states", False) else None
+    # The assistant REQUIRES this dict ({layer_type: (K, V)}), so we must ask
+    # for it explicitly. We try a few call signatures because the flag may be
+    # consumed at different wrapper levels (base vs unified model).
+    tgt_out = None
+    for attempt_kwargs in (
+        {"return_shared_kv_states": True, "output_hidden_states": True, "use_cache": True},
+        {"output_hidden_states": True, "use_cache": True},
+    ):
+        try:
+            with torch.no_grad():
+                tgt_out = target_base(
+                    input_ids=enc["input_ids"],
+                    attention_mask=enc.get("attention_mask"),
+                    **attempt_kwargs,
+                )
+            log(f"  target forward OK with kwargs={list(attempt_kwargs)}")
+            break
+        except TypeError as exc:
+            log(f"  target forward rejected kwargs={list(attempt_kwargs)}: {exc}")
+    if tgt_out is None:
+        log("  !! could not run target base forward; aborting.")
+        return 1
     log(f"  target output type = {type(tgt_out).__name__}")
-    log(f"  output fields      = {[f for f in dir(tgt_out) if not f.startswith('_')][:20]}")
     describe("last_hidden_state", getattr(tgt_out, "last_hidden_state", None))
+    hs = getattr(tgt_out, "hidden_states", None)
+    if hs is not None:
+        log(f"  hidden_states tuple: len={len(hs)} (embeddings + per-layer)")
+        log(f"    each: shape={tuple(hs[0].shape)}")
     shared_kv = getattr(tgt_out, "shared_kv_states", None)
     if shared_kv is None:
-        log("  !! shared_kv_states is None on the target output.")
-        log("     The assistant REQUIRES it. Investigate how prod/vLLM produces it")
-        log("     (may need a specific flag or the Gemma4 unified model).")
+        log("  !! shared_kv_states is STILL None even with return_shared_kv_states=True.")
+        log("     Target config has num_kv_shared_layers=0, so the standard model")
+        log("     may never populate it. Prod uses Gemma4UnifiedForConditionalGeneration")
+        log("     (see EAGLE-3 serve log). NEXT: try loading the target as the unified")
+        log("     model, or check whether /tmp/models/gemma4/text_only is unified.")
     else:
         describe("shared_kv_states", shared_kv)
     log("")
@@ -173,29 +198,44 @@ def main() -> int:
     lhs = getattr(tgt_out, "last_hidden_state", None)
     if lhs is None or shared_kv is None:
         log("  SKIP: missing last_hidden_state or shared_kv_states; see above.")
-        log("  Next: find the target flag/path that yields shared_kv_states")
-        log("  (likely the Gemma4 'unified' model used in prod, per RESULTS.md).")
+        log("  Next: obtain shared_kv_states (likely load the target as the")
+        log("  Gemma4Unified model used in prod). Re-run once that's available.")
         return 0
-    # First hypothesis: inputs_embeds = concat([hidden, hidden], dim=-1) to hit
-    # 2*backbone width. This is a GUESS; the run will confirm or correct it.
-    try:
-        candidate = torch.cat([lhs, lhs], dim=-1)
-        describe("candidate inputs_embeds", candidate)
-        with torch.no_grad():
-            asst_out = assistant(
-                inputs_embeds=candidate,
-                shared_kv_states=shared_kv,
-                position_ids=None,
-                attention_mask=enc.get("attention_mask"),
-            )
-        log("  assistant forward SUCCEEDED with concat([h,h]) hypothesis.")
-        describe("assistant.logits", getattr(asst_out, "logits", None))
-        describe("assistant.last_hidden_state",
-                 getattr(asst_out, "last_hidden_state", None))
-    except Exception as exc:
-        log(f"  assistant forward FAILED (expected until recipe confirmed): {exc}")
-        log("  ^ The error message above reveals the true expected input width /")
-        log("    shared_kv layout. Use it to fix the inputs_embeds recipe.")
+
+    # We know pre_projection wants 2*backbone (=5632) from a 2816-wide hidden,
+    # so inputs_embeds is a concat of TWO 2816-wide tensors. Which two? Try a
+    # few principled recipes and report which one the assistant accepts. The
+    # winning recipe defines the training data pipeline.
+    hs = getattr(tgt_out, "hidden_states", None)
+    recipes = {"concat(last, last)": torch.cat([lhs, lhs], dim=-1)}
+    if hs is not None and len(hs) >= 2:
+        # hs[0] = embeddings, hs[-1] = final; try last + second-to-last, and
+        # last + embeddings (common EAGLE-style low+high fusions).
+        recipes["concat(last, prev_layer)"] = torch.cat([lhs, hs[-2]], dim=-1)
+        recipes["concat(last, embeddings)"] = torch.cat([lhs, hs[0]], dim=-1)
+
+    succeeded = False
+    for name, candidate in recipes.items():
+        log(f"  -- trying inputs_embeds = {name}  shape={tuple(candidate.shape)}")
+        try:
+            with torch.no_grad():
+                asst_out = assistant(
+                    inputs_embeds=candidate,
+                    shared_kv_states=shared_kv,
+                    position_ids=None,
+                    attention_mask=enc.get("attention_mask"),
+                )
+            log(f"  ==> SUCCESS with recipe: {name}")
+            describe("assistant.logits", getattr(asst_out, "logits", None))
+            describe("assistant.last_hidden_state",
+                     getattr(asst_out, "last_hidden_state", None))
+            succeeded = True
+            break
+        except Exception as exc:
+            log(f"     failed: {type(exc).__name__}: {exc}")
+    if not succeeded:
+        log("  No recipe worked. The last error above reveals the true expected")
+        log("  input layout -- use it to fix the inputs_embeds recipe.")
     log("")
     log("=== Done. Use the shapes above to design the training data pipeline. ===")
     return 0
