@@ -25,28 +25,43 @@ speculators' MTP loss / step-weight logic is used only as a *reference*.
 | Target (verifier) | `google/gemma-4-26B-A4B-it` (FP8 text-only in prod) | frozen, produces embeds + KV |
 | Draft (assistant) | `google/gemma-4-26B-A4B-it-assistant` | the thing we fine-tune |
 
-## How the Gemma 4 assistant actually works (from transformers v5.10.2)
+## How the Gemma 4 assistant actually works (VERIFIED on server 2026-07-08)
 
 `Gemma4AssistantForCausalLM.forward` does **not** take token ids as its real
-input. It consumes intermediate tensors from the target model:
+input. It consumes intermediate tensors from the target model. All of the
+following was confirmed by running `scripts/debug_gemma_assistant.py` against
+`/tmp/models/gemma4/text_only` + `/tmp/models/gemma4/assistant`:
 
-- `inputs_embeds`: target hidden states, width `2 * backbone_hidden_size`
-  (2*2816 = 5632-ish input to `pre_projection`).
-- `shared_kv_states`: dict of the target's last-layer KV per `layer_type`
-  (full / sliding), reused as "past cache" by the 4-layer draft decoder.
+- **`inputs_embeds`** = `concat(target_last_hidden, target_last_hidden)` along
+  the last dim → width `2 * 2816 = 5632`, which `pre_projection` maps to 1024.
+  (The simplest recipe — duplicate the final hidden state — is the correct one;
+  verified: the assistant forward succeeded with `concat(last, last)`.)
+- **`shared_kv_states`** = the target base model's per-layer-type shared KV,
+  obtained by calling the target base forward with
+  **`return_shared_kv_states=True`**. It is a dict:
+  `{"sliding_attention": (K, V), "full_attention": (K, V)}`.
+  Despite the target config having `num_kv_shared_layers=0`, the standard
+  `Gemma4Model` DOES populate this when the flag is passed — **no need for the
+  unified model**.
+- Assistant output: `logits` of shape `(B, T, 262144)` (full vocab) and
+  `last_hidden_state` of shape `(B, T, 2816)`.
 
 Flow:
 
 ```
-inputs_embeds --pre_projection(2*2816 -> 1024)--> 4-layer decoder (uses shared_kv_states)
-  -> last_hidden_state
-     -> post_projection(1024 -> 2816)  = returned last_hidden_state
-     -> lm_head (tied to embed_tokens) = draft logits   (use_ordered_embeddings=false here)
+target base fwd (return_shared_kv_states=True)
+  -> last_hidden_state (B,T,2816)
+  -> shared_kv_states {sliding: (K,V), full: (K,V)}
+
+inputs_embeds = concat(last_hidden, last_hidden)  # (B,T,5632)
+assistant(inputs_embeds=..., shared_kv_states=...)
+  -> logits (B,T,262144)         # draft token distribution (lm_head tied to embed)
+  -> last_hidden_state (B,T,2816)
 ```
 
-Consequence for training: **we must run the target once per sample to produce
-`inputs_embeds` + `shared_kv_states`**, then feed those to the assistant. This
-is the first thing `scripts/debug_gemma_assistant.py` verifies.
+Consequence for training: run the target base **once per sample** to produce
+`last_hidden_state` + `shared_kv_states`, build `inputs_embeds` by duplication,
+feed the assistant, and train it to match the target's next-token distribution.
 
 ## Data
 
