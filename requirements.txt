@@ -1,0 +1,9 @@
+# MTP fine-tuning for the Gemma 4 assistant.
+# Pin to the transformers version that ships Gemma4AssistantForCausalLM.
+# The server container may already provide these; this file documents the
+# minimum interface we rely on.
+transformers>=5.10.2
+torch>=2.5
+accelerate>=1.0
+# datasets is used for the MAI Profile pipeline (target-regenerated JSONL).
+datasets>=4.0

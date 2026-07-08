@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Data / models / outputs (never commit large artifacts)
+*.safetensors
+*.bin
+*.pt
+*.arrow
+data/
+output/
+outputs/
+checkpoints/
+*.jsonl
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
