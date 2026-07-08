@@ -16,6 +16,8 @@ Run:  python -m pytest gemma4_mtp/test_training_step.py -q
 
 from __future__ import annotations
 
+import json
+
 import torch
 import torch.nn as nn
 
@@ -157,9 +159,62 @@ def test_perfect_match_gives_low_soft_ce():
     print(f"✅ matched soft_ce={good.item():.4f} < mismatched={bad.item():.4f}")
 
 
+def test_collate_pads_and_aligns():
+    """collate right-pads variable-length samples and keeps masks aligned."""
+    import torch
+    from gemma4_mtp.data import collate
+
+    pad = 999
+    a = {"input_ids": torch.tensor([1, 2, 3]),
+         "attention_mask": torch.tensor([1, 1, 1]),
+         "loss_mask": torch.tensor([0, 1, 1])}
+    b = {"input_ids": torch.tensor([4, 5]),
+         "attention_mask": torch.tensor([1, 1]),
+         "loss_mask": torch.tensor([0, 1])}
+    out = collate([a, b], pad_token_id=pad)
+    assert out["input_ids"].shape == (2, 3)
+    # shorter sample padded with pad id, and its pad positions unmasked.
+    assert out["input_ids"][1, 2].item() == pad
+    assert out["attention_mask"][1, 2].item() == 0
+    assert out["loss_mask"][1, 2].item() == 0
+    # real content preserved
+    assert out["input_ids"][0].tolist() == [1, 2, 3]
+    assert out["loss_mask"][0].tolist() == [0, 1, 1]
+    print("✅ collate pads + aligns masks correctly")
+
+
+def test_iter_jsonl_roundtrip():
+    """iter_jsonl reads one object per line, skipping blanks."""
+    import os
+    import tempfile
+    from gemma4_mtp.data import iter_jsonl
+
+    rows = [
+        {"conversations": [{"role": "user", "content": "hi"},
+                           {"role": "assistant", "content": "hello"}],
+         "status": "success"},
+        {"conversations": [{"role": "user", "content": "x"}], "status": "error"},
+    ]
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+            f.write("\n")  # blank line should be skipped
+        got = list(iter_jsonl(path))
+        assert len(got) == 2
+        assert got[0]["status"] == "success"
+        assert got[1]["status"] == "error"
+        print("✅ iter_jsonl round-trips + skips blank lines")
+    finally:
+        os.remove(path)
+
+
 if __name__ == "__main__":
     test_build_target_signals_shapes()
     test_distillation_loss_masks_and_backprops()
     test_fully_masked_batch_is_safe()
     test_perfect_match_gives_low_soft_ce()
+    test_collate_pads_and_aligns()
+    test_iter_jsonl_roundtrip()
     print("\nAll local logic tests passed.")
