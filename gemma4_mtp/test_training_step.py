@@ -210,6 +210,33 @@ def test_iter_jsonl_roundtrip():
         os.remove(path)
 
 
+def test_freeze_policy():
+    """set_trainable freezes target + assistant lm_head/embed, trains the rest."""
+    from gemma4_mtp.train import set_trainable
+
+    target = MockTarget()
+    assistant = MockAssistant()
+    # MockAssistant has no .model.embed_tokens; add a matching structure so the
+    # freeze logic can find the tied embed like the real assistant.
+    assistant.model = nn.Module()
+    assistant.model.embed_tokens = nn.Embedding(VOCAB, HID)
+
+    trainable = set_trainable(target, assistant)
+
+    # target fully frozen
+    assert all(not p.requires_grad for p in target.parameters())
+    # assistant lm_head frozen
+    assert all(not p.requires_grad for p in assistant.lm_head.parameters())
+    # assistant embed frozen
+    assert all(not p.requires_grad for p in assistant.model.embed_tokens.parameters())
+    # decoder + projections trained
+    assert all(p.requires_grad for p in assistant.pre_projection.parameters())
+    assert all(p.requires_grad for p in assistant.decoder.parameters())
+    # returned list is non-empty and only trainable params
+    assert len(trainable) > 0 and all(p.requires_grad for p in trainable)
+    print(f"✅ freeze policy correct ({len(trainable)} trainable tensors)")
+
+
 if __name__ == "__main__":
     test_build_target_signals_shapes()
     test_distillation_loss_masks_and_backprops()
@@ -217,4 +244,5 @@ if __name__ == "__main__":
     test_perfect_match_gives_low_soft_ce()
     test_collate_pads_and_aligns()
     test_iter_jsonl_roundtrip()
+    test_freeze_policy()
     print("\nAll local logic tests passed.")

@@ -74,15 +74,40 @@ the raw human answers.
 ## Status
 
 - [x] Repo scaffold + README
-- [ ] `scripts/debug_gemma_assistant.py` — load assistant, print shapes, verify
-      the `inputs_embeds` / `shared_kv_states` interface end-to-end (no training)
-- [ ] Data pipeline: target-regenerated MAI Profile -> (embeds, KV, labels)
-- [ ] Training loop: soft-CE distillation + multi-token step weights, freeze
-      embed/lm_head, train only the draft decoder + projections
-- [ ] Export in a format vLLM loads as the stock assistant
-- [ ] Benchmark vs stock assistant on the vllm-msn scaffold
+- [x] `scripts/debug_gemma_assistant.py` — interface VERIFIED on server
+- [x] Core training step — `gemma4_mtp/training_step.py` (single-step
+      distillation; soft-CE/KL to target). Local logic tests green.
+- [x] Data pipeline — `gemma4_mtp/data.py` (MAI Profile conversations ->
+      input_ids/loss_mask, DSpark-compatible masking). Local tests green.
+- [x] Training loop — `gemma4_mtp/train.py` (freeze target + assistant
+      lm_head/embed; train the 4 decoder layers + projections; AdamW + cosine;
+      export stock-config checkpoint for vLLM). Freeze policy unit-tested.
+- [ ] **Server run**: train on MAI Profile data, export, benchmark vs the stock
+      assistant on the vllm-msn scaffold (real acceptance/tok-s numbers).
 
-## Local dev note
+### Run (server)
+
+```bash
+# smoke test first: a handful of steps to confirm loss is finite + decreasing
+python -m gemma4_mtp.train \
+    --target /tmp/models/gemma4/text_only \
+    --assistant /tmp/models/gemma4/assistant \
+    --data /path/to/maiprofile_regenerated.jsonl \
+    --output ./out/mtp_smoke --bf16 --max-steps 20 --log-every 1
+
+# full run
+python -m gemma4_mtp.train \
+    --target /tmp/models/gemma4/text_only \
+    --assistant /tmp/models/gemma4/assistant \
+    --data /path/to/maiprofile_regenerated.jsonl \
+    --output ./out/mtp_maiprofile --bf16 \
+    --epochs 1 --batch-size 2 --grad-accum 8 --lr 1e-4
+```
+
+Then benchmark the exported `./out/mtp_maiprofile` by pointing the vllm-msn MTP
+config's assistant path at it and comparing to the stock assistant.
+
+### Local dev note
 
 This is developed on a no-GPU machine: only syntax / structure checks locally,
 real runs happen on the 8×A100 server. All code is committed and pulled on the
