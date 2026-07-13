@@ -89,8 +89,20 @@ def main():
     # sharing; the assistant's own embed outputs draft_dim which is wrong here
     # (would make combined 1024+2816=3840 instead of the required 5632).
     def _find_embed(mod):
+        import torch.nn as nn
+        # 1) Official transformers API — every model implements this.
+        try:
+            emb = mod.get_input_embeddings()
+            if emb is not None:
+                return emb
+        except Exception:
+            pass
+        # 2) Common explicit paths.
         for path in ("model.embed_tokens", "embed_tokens",
-                     "model.model.embed_tokens"):
+                     "model.model.embed_tokens",
+                     "model.language_model.embed_tokens",
+                     "language_model.model.embed_tokens",
+                     "model.language_model.model.embed_tokens"):
             obj = mod
             ok = True
             for part in path.split("."):
@@ -100,12 +112,24 @@ def main():
                     break
             if ok:
                 return obj
+        # 3) Fallback: first Embedding whose dim matches backbone (2816).
+        candidates = [(n, m) for n, m in mod.named_modules()
+                      if isinstance(m, nn.Embedding)]
+        for n, m in candidates:
+            if m.embedding_dim == 2816:
+                return m
+        # Diagnostic: dump the embedding candidates so we can fix the path.
+        print("  [diag] Embedding modules found in target:", flush=True)
+        for n, m in candidates:
+            print(f"    {n}: num_embeddings={m.num_embeddings} dim={m.embedding_dim}",
+                  flush=True)
         return None
 
     target_embed = _find_embed(target)
     if target_embed is None:
         raise RuntimeError(
-            "could not locate target embed_tokens; inspect target module tree")
+            "could not locate target embed_tokens; see [diag] module list above")
+    print(f"  target_embed dim = {target_embed.embedding_dim}", flush=True)
     asst_pre_proj = getattr(assistant, "pre_projection", None)
     # backbone_hidden_size for the normalizer. Gemma4Config is multimodal:
     # hidden_size lives in text_config, not at the top level. backbone_hidden_size
