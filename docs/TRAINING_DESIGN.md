@@ -100,3 +100,32 @@ architecture and the fastest path to a first acceptance-rate number.
 Save the fine-tuned assistant with the **same config/architecture** as the stock
 `google/gemma-4-26B-A4B-it-assistant` so vLLM loads it identically. Then bench on
 the vllm-msn scaffold (MTP config, swap assistant path) vs the stock assistant.
+
+## Cross-check against speculators PR #768 (official Gemma4 MTP support)
+
+speculators is adding official Gemma4 MTP *training* support via a 3-PR stack
+(Issue #586): #758 (extract verifier KV), #767 (multi-level LM head), #768
+(`QueryOnlyGemma2Attention`). As of research all three are OPEN / unmerged.
+
+That work **rebuilds** the drafter from `Gemma2DecoderLayer` inside speculators,
+so it must manually handle three things. We reuse Google's native
+`Gemma4AssistantForCausalLM`, so the official transformers forward handles all
+three for us — verified against `modeling_gemma4.py` v5.10.2:
+
+1. **KV is pre-rotated.** #768 notes "verifier's KV cache already has RoPE
+   applied". Confirmed in official Gemma4: a non-shared layer stores KV into
+   `shared_kv_states` *after* `apply_rotary_pos_emb`
+   (`store_full_length_kv` path), so the shared KV we pass to the assistant is
+   already rotated.
+2. **RoPE on query only.** #768 applies RoPE to queries only. Confirmed: on a
+   kv-shared layer the official code rotates `query_states` but reuses
+   `shared_kv_states[layer_type]` directly (no re-rotation of KV).
+3. **sliding vs full routing.** #768 picks local/global KV by `sliding_window`.
+   Confirmed: official code indexes `shared_kv_states[self.layer_type]`
+   ({sliding_attention, full_attention}) automatically.
+
+**Conclusion:** our approach needs no low-level attention/RoPE/KV handling — the
+native assistant forward is correct by construction. This validates the decision
+to use the official assistant instead of porting into speculators, and avoids
+depending on three unmerged PRs. #768 remains a useful reference for the
+centroid-masked (multi-level) LM head if we later unfreeze/adopt it.
