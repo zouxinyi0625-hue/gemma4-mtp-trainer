@@ -82,13 +82,42 @@ def main():
     # Locate sub-modules we need for the recursive recipe.
     target_base = getattr(target, "model", target)
     target_lm_head = getattr(target, "lm_head", None)
-    asst_embed = getattr(assistant, "model", assistant)
-    asst_embed = getattr(asst_embed, "embed_tokens", None)
+
+    # Assistant embed_tokens: search a couple of nesting levels robustly.
+    def _find_embed(mod):
+        for path in ("model.embed_tokens", "embed_tokens",
+                     "model.model.embed_tokens"):
+            obj = mod
+            ok = True
+            for part in path.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    ok = False
+                    break
+            if ok:
+                return obj
+        return None
+
+    asst_embed = _find_embed(assistant)
+    if asst_embed is None:
+        raise RuntimeError(
+            "could not locate assistant embed_tokens; inspect assistant module tree")
     asst_pre_proj = getattr(assistant, "pre_projection", None)
-    # backbone_hidden_size for the normalizer
-    backbone_hidden_size = getattr(assistant.config, "backbone_hidden_size",
-                                   target_base.config.hidden_size
-                                   if hasattr(target_base, "config") else 2816)
+    # backbone_hidden_size for the normalizer. Gemma4Config is multimodal:
+    # hidden_size lives in text_config, not at the top level. backbone_hidden_size
+    # is a top-level field on the assistant config.
+    def _hidden_size(cfg):
+        if hasattr(cfg, "get_text_config"):
+            tc = cfg.get_text_config()
+            if getattr(tc, "hidden_size", None):
+                return tc.hidden_size
+        return getattr(cfg, "hidden_size", None)
+
+    backbone_hidden_size = (
+        getattr(assistant.config, "backbone_hidden_size", None)
+        or _hidden_size(target.config)
+        or 2816
+    )
     normalizer = math.sqrt(backbone_hidden_size)
     print(f"  backbone_hidden_size={backbone_hidden_size}, normalizer={normalizer:.2f}",
           flush=True)
