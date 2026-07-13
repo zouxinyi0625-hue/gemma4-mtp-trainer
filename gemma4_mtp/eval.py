@@ -83,7 +83,11 @@ def main():
     target_base = getattr(target, "model", target)
     target_lm_head = getattr(target, "lm_head", None)
 
-    # Assistant embed_tokens: search a couple of nesting levels robustly.
+    # Token embedding MUST be the TARGET's backbone-dim embedding (2816), not the
+    # assistant's draft-dim embedding (1024). vLLM's gemma4_mtp.py replaces the
+    # draft embed_tokens with the target's backbone embedding after embedding
+    # sharing; the assistant's own embed outputs draft_dim which is wrong here
+    # (would make combined 1024+2816=3840 instead of the required 5632).
     def _find_embed(mod):
         for path in ("model.embed_tokens", "embed_tokens",
                      "model.model.embed_tokens"):
@@ -98,10 +102,10 @@ def main():
                 return obj
         return None
 
-    asst_embed = _find_embed(assistant)
-    if asst_embed is None:
+    target_embed = _find_embed(target)
+    if target_embed is None:
         raise RuntimeError(
-            "could not locate assistant embed_tokens; inspect assistant module tree")
+            "could not locate target embed_tokens; inspect target module tree")
     asst_pre_proj = getattr(assistant, "pre_projection", None)
     # backbone_hidden_size for the normalizer. Gemma4Config is multimodal:
     # hidden_size lives in text_config, not at the top level. backbone_hidden_size
@@ -192,7 +196,7 @@ def main():
                     # Recursive recipe (vLLM gemma4_mtp.py):
                     # inputs_embeds = embed(tok) * sqrt(backbone_dim)
                     # combined = cat(inputs_embeds, hidden_states)
-                    tok_embed = asst_embed(tok) * normalizer  # (1, 1, 2816)
+                    tok_embed = target_embed(tok) * normalizer  # (1, 1, 2816)
                     combined = torch.cat([tok_embed, backbone_h], dim=-1)  # (1, 1, 5632)
 
                     # Run the assistant forward
