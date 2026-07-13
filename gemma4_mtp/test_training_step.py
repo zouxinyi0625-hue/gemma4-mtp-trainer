@@ -24,7 +24,7 @@ import torch.nn as nn
 from gemma4_mtp.training_step import (
     MTPLossConfig,
     build_target_signals,
-    distillation_loss,
+    compute_step_weights,
     training_step,
 )
 
@@ -59,27 +59,35 @@ class MockTargetBase(nn.Module):
 
 
 class MockTarget(nn.Module):
-    """Mimics Gemma4ForConditionalGeneration: .model + .lm_head."""
+    """Mimics Gemma4ForConditionalGeneration: .model + .lm_head + embed."""
 
     def __init__(self):
         super().__init__()
         self.model = MockTargetBase()
         self.lm_head = nn.Linear(HID, VOCAB, bias=False)
 
+    def get_input_embeddings(self):
+        return self.model.embed
+
 
 class _AsstOut:
-    def __init__(self, logits):
+    def __init__(self, logits, last_hidden_state):
         self.logits = logits
+        self.last_hidden_state = last_hidden_state
 
 
 class MockAssistant(nn.Module):
-    """Mimics Gemma4AssistantForCausalLM: pre_projection(2*HID->HID) + head."""
+    """Mimics Gemma4AssistantForCausalLM: pre_projection(2*HID->HID) + head.
+
+    Returns logits + last_hidden_state (the backbone-dim hidden fed back in TTT).
+    """
 
     def __init__(self):
         super().__init__()
         self.pre_projection = nn.Linear(2 * HID, HID, bias=False)
         self.decoder = nn.Linear(HID, HID)      # stand-in for 4 layers
         self.lm_head = nn.Linear(HID, VOCAB, bias=False)
+        self.post_projection = nn.Linear(HID, HID, bias=False)
 
     def forward(self, inputs_embeds=None, shared_kv_states=None,
                 position_ids=None, attention_mask=None):
@@ -87,7 +95,8 @@ class MockAssistant(nn.Module):
         assert shared_kv_states is not None, "assistant requires shared_kv_states"
         h = self.pre_projection(inputs_embeds)
         h = torch.tanh(self.decoder(h))
-        return _AsstOut(self.lm_head(h))
+        backbone = self.post_projection(h)      # (B, L, HID)
+        return _AsstOut(self.lm_head(h), backbone)
 
 
 def _batch():
@@ -111,11 +120,15 @@ def test_build_target_signals_shapes():
     print("✅ build_target_signals shapes OK")
 
 
-def test_distillation_loss_masks_and_backprops():
+def test_ttt_masks_and_backprops():
     target = MockTarget()
     assistant = MockAssistant()
+    # Freeze the target exactly like train.set_trainable does in real training.
+    for p in target.parameters():
+        p.requires_grad_(False)
     b = _batch()
-    cfg = MTPLossConfig(temperature=1.0, soft_ce_weight=1.0, hard_ce_weight=0.5)
+    cfg = MTPLossConfig(ttt_steps=3, temperature=1.0,
+                        soft_ce_weight=1.0, hard_ce_weight=0.5)
     loss, metrics = training_step(target, assistant, b, cfg)
     assert loss.requires_grad, "loss must be differentiable"
     assert loss.ndim == 0, "loss must be scalar"
@@ -126,9 +139,12 @@ def test_distillation_loss_masks_and_backprops():
     tgt_grad = any(p.grad is not None for p in target.parameters())
     assert asst_grad, "assistant should get gradients"
     assert not tgt_grad, "target should be frozen (no grad in step)"
-    assert "soft_ce" in metrics and "hard_ce" in metrics
-    print(f"✅ loss={loss.item():.4f} soft_ce={metrics['soft_ce'].item():.4f} "
-          f"hard_ce={metrics['hard_ce'].item():.4f}; grads routed correctly")
+    # TTT produces per-step metrics for each of the 3 steps.
+    assert "step0_soft_ce" in metrics and "step2_soft_ce" in metrics
+    assert "step0_hard_ce" in metrics
+    print(f"✅ TTT loss={loss.item():.4f} "
+          f"step0_soft={metrics['step0_soft_ce'].item():.4f} "
+          f"step2_soft={metrics['step2_soft_ce'].item():.4f}; grads routed correctly")
 
 
 def test_fully_masked_batch_is_safe():
@@ -137,26 +153,24 @@ def test_fully_masked_batch_is_safe():
     assistant = MockAssistant()
     b = _batch()
     b["loss_mask"] = torch.zeros(B, T, dtype=torch.long)
-    cfg = MTPLossConfig(hard_ce_weight=0.0)
+    cfg = MTPLossConfig(ttt_steps=3, hard_ce_weight=0.0)
     loss, _ = training_step(target, assistant, b, cfg)
     assert torch.isfinite(loss), "loss must be finite even with empty mask"
     print("✅ fully-masked batch produces finite loss (no div-by-zero)")
 
 
-def test_perfect_match_gives_low_soft_ce():
-    """If draft logits == target logits, soft-CE should equal the target's entropy
-    (finite, and lower than a mismatched case)."""
-    torch.manual_seed(1)
-    t_logits = torch.randn(B, T, VOCAB)
-    d_logits_match = t_logits.clone().requires_grad_(True)
-    d_logits_bad = torch.randn(B, T, VOCAB, requires_grad=True)
-    ids = torch.randint(0, VOCAB, (B, T))
-    mask = torch.ones(B, T, dtype=torch.long)
-    cfg = MTPLossConfig(hard_ce_weight=0.0)
-    good, _ = distillation_loss(d_logits_match, t_logits, ids, mask, cfg)
-    bad, _ = distillation_loss(d_logits_bad, t_logits, ids, mask, cfg)
-    assert good < bad, f"matched logits should give lower soft-CE ({good} vs {bad})"
-    print(f"✅ matched soft_ce={good.item():.4f} < mismatched={bad.item():.4f}")
+def test_step_weights_normalized():
+    """Default decaying step weights sum to 1 and decrease."""
+    cfg = MTPLossConfig(ttt_steps=5, step_weight_beta=0.8)
+    w = compute_step_weights(cfg)
+    assert len(w) == 5
+    assert abs(sum(w) - 1.0) < 1e-6, f"weights should sum to 1, got {sum(w)}"
+    assert all(w[i] > w[i+1] for i in range(4)), "weights should decay"
+    # Explicit weights are passed through.
+    cfg2 = MTPLossConfig(ttt_steps=3, step_weights=[1.0, 0.5, 0.25])
+    assert compute_step_weights(cfg2) == [1.0, 0.5, 0.25]
+    print(f"✅ step weights normalized+decaying: "
+          f"{[round(x,3) for x in w]}")
 
 
 def test_collate_pads_and_aligns():
@@ -239,9 +253,9 @@ def test_freeze_policy():
 
 if __name__ == "__main__":
     test_build_target_signals_shapes()
-    test_distillation_loss_masks_and_backprops()
+    test_ttt_masks_and_backprops()
     test_fully_masked_batch_is_safe()
-    test_perfect_match_gives_low_soft_ce()
+    test_step_weights_normalized()
     test_collate_pads_and_aligns()
     test_iter_jsonl_roundtrip()
     test_freeze_policy()

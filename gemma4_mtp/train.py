@@ -45,6 +45,10 @@ def parse_args():
     ap.add_argument("--warmup-steps", type=int, default=100)
     ap.add_argument("--max-length", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--ttt-steps", type=int, default=5,
+                    help="TTT draft steps to unroll (match deployment spec_tokens)")
+    ap.add_argument("--step-weight-beta", type=float, default=0.8,
+                    help="decay for per-step loss weights (beta**k, normalized)")
     ap.add_argument("--soft-ce-weight", type=float, default=1.0)
     ap.add_argument("--hard-ce-weight", type=float, default=0.0)
     ap.add_argument("--bf16", action="store_true", help="load models in bfloat16")
@@ -132,6 +136,8 @@ def main():
     )
 
     loss_cfg = MTPLossConfig(
+        ttt_steps=args.ttt_steps,
+        step_weight_beta=args.step_weight_beta,
         temperature=args.temperature,
         soft_ce_weight=args.soft_ce_weight,
         hard_ce_weight=args.hard_ce_weight,
