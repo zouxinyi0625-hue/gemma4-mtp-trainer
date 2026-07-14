@@ -91,17 +91,29 @@ def main():
     parser = Gemma4ConversationParser(tok, max_length=args.max_length)
 
     # Load + tokenize all rows (cheap vs target forward), then shard by rank.
-    log("=== Tokenizing rows ===")
-    rows = []
-    seen = 0
+    # Each rank only tokenizes + caches ITS OWN shard: the usable-row global
+    # index (uidx) is assigned in file order; rank owns uidx % world == rank.
+    # This makes tokenization 8x parallel instead of every rank tokenizing all
+    # rows (the cause of the slow silent "Tokenizing rows" stage).
+    log(f"=== Rank {rank}: tokenizing + caching own shard ===")
+    uidx = -1          # global index over USABLE rows
+    done = 0
+    mine = 0
     for obj in iter_jsonl(args.data):
-        seen += 1
-        if rank == 0 and seen % 2000 == 0:
-            print(f"[rank0] read {seen} rows, {len(rows)} kept", flush=True)
         if obj.get("status") not in (None, "success"):
             continue
         conv = obj.get("conversations")
         if not conv:
+            continue
+        uidx += 1
+        if args.limit and uidx >= args.limit:
+            break
+        if uidx % world != rank:
+            continue          # not our shard — skip tokenization entirely
+        out_path = os.path.join(args.out_dir, f"sample_{uidx:07d}.pt")
+        mine += 1
+        if os.path.exists(out_path):
+            done += 1
             continue
         try:
             parsed = parser.parse(conv)
@@ -109,22 +121,6 @@ def main():
             continue
         if int(parsed["loss_mask"].sum()) == 0:
             continue
-        rows.append(parsed)
-        if args.limit and len(rows) >= args.limit:
-            break
-    log(f"  {len(rows)} usable samples")
-
-    # Shard across ranks.
-    my_rows = list(range(rank, len(rows), world))
-    log(f"=== Rank {rank} caching {len(my_rows)} samples ===")
-
-    done = 0
-    for idx in my_rows:
-        out_path = os.path.join(args.out_dir, f"sample_{idx:07d}.pt")
-        if os.path.exists(out_path):
-            done += 1
-            continue
-        parsed = rows[idx]
         input_ids = parsed["input_ids"].unsqueeze(0).to(device)     # (1, T)
         attn = parsed["attention_mask"].unsqueeze(0).to(device)
 
@@ -158,21 +154,23 @@ def main():
         os.replace(tmp, out_path)
         done += 1
         if rank == 0 and done % 50 == 0:
-            print(f"[rank0] cached {done}/{len(my_rows)}", flush=True)
+            print(f"[rank0] cached {done} (shard {mine})", flush=True)
 
     log(f"=== Rank {rank} done: {done} samples ===")
     if ddp:
         dist.barrier()
         if rank == 0:
+            import glob
+            n_files = len(glob.glob(os.path.join(args.out_dir, "sample_*.pt")))
             meta = {
                 "data": args.data,
-                "num_samples": len(rows),
+                "num_samples": n_files,
                 "max_length": args.max_length,
                 "dtype": "bf16" if args.bf16 else "fp32",
             }
             with open(os.path.join(args.out_dir, "cache_meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
-            print(f"[done] cache at {args.out_dir} ({len(rows)} samples)", flush=True)
+            print(f"[done] cache at {args.out_dir} ({n_files} samples)", flush=True)
         dist.destroy_process_group()
 
 
