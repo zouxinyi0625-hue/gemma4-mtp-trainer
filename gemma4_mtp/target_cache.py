@@ -75,17 +75,17 @@ def atomic_json_dump(payload, path: str):
     os.replace(tmp_path, path)
 
 
-def expected_tensor_nbytes(*, seq_len, hidden_size, num_kv_heads, head_dim):
-    kv = int(seq_len) * int(num_kv_heads) * int(head_dim) * 2
-    return {
+def expected_tensor_nbytes(*, seq_len, hidden_size, kv_dims):
+    """kv_dims: {field_name: (num_kv_heads, head_dim)} — full and sliding differ."""
+    out = {
         "input_ids": int(seq_len) * 4,
         "loss_mask": int(seq_len) * 1,
         "last_hidden": int(seq_len) * int(hidden_size) * 2,
-        "kv_full_k": kv,
-        "kv_full_v": kv,
-        "kv_slide_k": kv,
-        "kv_slide_v": kv,
     }
+    for name in _KV_FIELDS:
+        heads, dim = kv_dims[name]
+        out[name] = int(seq_len) * int(heads) * int(dim) * 2
+    return out
 
 
 def pack_index_record(*, sample_id, shard_id, seq_len, offsets):
@@ -381,16 +381,18 @@ def finalize_index(*, output_dir, summaries, shard_map):
     return next_sample_id
 
 
-def build_manifest(*, num_samples, shards, hidden_size, num_kv_heads, head_dim,
+def build_manifest(*, num_samples, shards, hidden_size, kv_dims,
                    extra_fields=None):
+    """kv_dims: {field_name: (num_kv_heads, head_dim)}. full/sliding differ, so
+    each KV field stores its own head count and head dim."""
     manifest = {
         "version": CACHE_VERSION,
         "num_samples": int(num_samples),
         "num_shards": len(shards),
         "index_record_size": INDEX_RECORD_SIZE,
         "hidden_size": int(hidden_size),
-        "num_kv_heads": int(num_kv_heads),
-        "head_dim": int(head_dim),
+        "kv_dims": {name: [int(kv_dims[name][0]), int(kv_dims[name][1])]
+                    for name in _KV_FIELDS},
         "shards": shards,
     }
     if extra_fields:
@@ -441,8 +443,8 @@ class CacheDataset(torch.utils.data.Dataset):
         self.manifest = load_manifest(self.cache_dir)
         self.num_samples = int(self.manifest["num_samples"])
         self.hidden_size = int(self.manifest["hidden_size"])
-        self.num_kv_heads = int(self.manifest["num_kv_heads"])
-        self.head_dim = int(self.manifest["head_dim"])
+        self.kv_dims = {name: (int(h), int(d))
+                        for name, (h, d) in self.manifest["kv_dims"].items()}
         self.index_path = os.path.join(self.cache_dir, "samples.idx")
         self.index_file = None
         self.index_mmap = None
@@ -534,8 +536,7 @@ class CacheDataset(torch.utils.data.Dataset):
         off = record["offsets"]
         shard_mmap = self._get_shard_mmap(int(record["shard_id"]))
         nbytes = expected_tensor_nbytes(
-            seq_len=seq_len, hidden_size=self.hidden_size,
-            num_kv_heads=self.num_kv_heads, head_dim=self.head_dim)
+            seq_len=seq_len, hidden_size=self.hidden_size, kv_dims=self.kv_dims)
 
         input_ids = self._read_int(
             shard_mmap=shard_mmap, offset=off["input_ids"], count=seq_len,
@@ -549,10 +550,11 @@ class CacheDataset(torch.utils.data.Dataset):
 
         out = {"input_ids": input_ids, "loss_mask": loss_mask, "last_hidden": last_hidden}
         for name in _KV_FIELDS:
+            heads, dim = self.kv_dims[name]
             # stored as (T, Hkv, D); transpose back to (Hkv, T, D) for collate.
             kv = self._read_bf16(
                 shard_mmap=shard_mmap, offset=off[name],
-                shape=(seq_len, self.num_kv_heads, self.head_dim), nbytes=nbytes[name])
+                shape=(seq_len, heads, dim), nbytes=nbytes[name])
             out[name] = kv.transpose(0, 1).contiguous()
         return out
 

@@ -115,7 +115,8 @@ def main():
         max_queue_size=args.max_queue_size,
     )
 
-    hidden_size = num_kv_heads = head_dim = None
+    hidden_size = None
+    kv_dims = None
     log(f"=== Rank {rank}: tokenizing + caching own shard ===")
     uidx = -1          # global index over USABLE rows
     done = 0
@@ -151,8 +152,15 @@ def main():
 
             if hidden_size is None:
                 hidden_size = int(last_hidden.shape[-1])
-                num_kv_heads = int(fk.shape[1])
-                head_dim = int(fk.shape[-1])
+                # full and sliding KV have DIFFERENT head counts / head dims
+                # (e.g. full (2, T, 512) vs sliding (8, T, 256)), so capture each
+                # field's own (Hkv, D). fk/fv/sk/sv are (1, Hkv, T, D).
+                kv_dims = {
+                    "kv_full_k": (int(fk.shape[1]), int(fk.shape[-1])),
+                    "kv_full_v": (int(fv.shape[1]), int(fv.shape[-1])),
+                    "kv_slide_k": (int(sk.shape[1]), int(sk.shape[-1])),
+                    "kv_slide_v": (int(sv.shape[1]), int(sv.shape[-1])),
+                }
 
             # write_sample converts to CPU bytes off the GPU thread; slice batch
             # dim off the KV so they are (Hkv, T, D).
@@ -186,14 +194,20 @@ def main():
 
     log(f"=== Rank {rank} done: {done} samples ===")
 
-    # Broadcast tensor dims to rank 0 (a rank with 0 samples has None); pick any
-    # rank's dims via all_reduce max (dims are identical across ranks).
+    # Broadcast tensor dims to all ranks (a rank with 0 samples has None); pick
+    # any rank's dims via all_reduce max (dims are identical across ranks). We
+    # flatten hidden_size + each KV field's (Hkv, D) into one tensor.
+    kv_field_order = tc._KV_FIELDS
     if ddp:
-        dims = torch.tensor(
-            [hidden_size or 0, num_kv_heads or 0, head_dim or 0],
-            device=device, dtype=torch.long)
+        flat = [hidden_size or 0]
+        for name in kv_field_order:
+            h, d = (kv_dims[name] if kv_dims else (0, 0))
+            flat += [h, d]
+        dims = torch.tensor(flat, device=device, dtype=torch.long)
         dist.all_reduce(dims, op=dist.ReduceOp.MAX)
-        hidden_size, num_kv_heads, head_dim = (int(dims[0]), int(dims[1]), int(dims[2]))
+        hidden_size = int(dims[0])
+        kv_dims = {name: (int(dims[1 + 2 * i]), int(dims[2 + 2 * i]))
+                   for i, name in enumerate(kv_field_order)}
         dist.barrier()
 
     if rank == 0:
@@ -211,7 +225,7 @@ def main():
             output_dir=args.out_dir, summaries=summaries, shard_map=shard_map)
         manifest = tc.build_manifest(
             num_samples=num_samples, shards=shards,
-            hidden_size=hidden_size, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            hidden_size=hidden_size, kv_dims=kv_dims,
             extra_fields={
                 "data": args.data,
                 "max_length": args.max_length,
