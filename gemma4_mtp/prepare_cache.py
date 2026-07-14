@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline target-signal cache for MTP training (the DSpark prepare_data pattern).
+"""Offline target-signal cache for MTP training (async sharded storage).
 
 MTP training's cost is dominated by the frozen 26B target forward that produces,
 per sample:
@@ -9,18 +9,23 @@ per sample:
 
 Recomputing this every step/epoch is wasteful and OOMs (V=262144 softmax). The
 target is FROZEN, so these signals are identical every epoch. We precompute them
-ONCE here, 8-GPU data-parallel, and stream to disk (mount). train.py then reads
-the cache and only runs the small assistant — no 26B target, no OOM.
+ONCE here, 8-GPU data-parallel, and stream to a sharded on-mount cache. train.py
+then reads the cache and only runs the small assistant — no 26B target, no OOM.
 
-Storage note (why not store logits): full (T, 262144) logits are ~1GB/sample.
-We DON'T store them at all — target soft labels are recomputed at train time as
-lm_head(last_hidden), a single frozen matmul evaluated only on supervised
-(loss_mask==1) positions. This gives the FULL distribution, not a top-K approx,
-and keeps the cache small.
+Storage (see gemma4_mtp.target_cache): samples are packed into a few large
+`shard-NNNNN.bin` files with a fixed-width `samples.idx` and `manifest.json`,
+written OFF the GPU thread by a background writer draining a bounded queue. This
+replaces the old per-sample .pt files (slow on a network mount) and never blocks
+the GPU forward on disk IO; a slow mount just throttles the producer via queue
+backpressure.
 
-Per-sample cache (one .pt file):
+We DON'T store logits (~1GB/sample): target soft labels are recomputed at train
+time as lm_head(last_hidden), a single frozen matmul on supervised positions —
+full distribution, small cache.
+
+Per-sample cache fields:
   input_ids      (T,)        int32
-  loss_mask      (T,)        int8
+  loss_mask      (T,)        uint8
   last_hidden    (T, H)      bf16
   kv_full_k/v    (Hkv, T, D) bf16   (last full-attention layer KV)
   kv_slide_k/v   (Hkv, T, D) bf16   (last sliding-attention layer KV)
@@ -37,7 +42,6 @@ Run 8-GPU:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 
 
@@ -46,10 +50,16 @@ def parse_args():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--target", required=True)
     ap.add_argument("--data", required=True, help="conversations JSONL")
-    ap.add_argument("--out-dir", required=True, help="cache output dir (mount ok)")
+    ap.add_argument("--out-dir", required=True,
+                    help="cache output dir (mount ok); must be empty")
     ap.add_argument("--max-length", type=int, default=4096)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="cap #samples (debug)")
+    ap.add_argument("--max-shard-bytes", type=int, default=64 * 1024 ** 3,
+                    help="roll to a new shard past this size (default 64 GiB)")
+    ap.add_argument("--max-queue-size", type=int, default=64,
+                    help="async writer queue depth; bounds in-flight samples and "
+                         "provides backpressure when the mount is slow")
     return ap.parse_args()
 
 
@@ -59,8 +69,9 @@ def main():
     import torch.distributed as dist
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from gemma4_mtp.data import DataConfig, Gemma4ConversationParser, iter_jsonl
+    from gemma4_mtp.data import Gemma4ConversationParser, iter_jsonl
     from gemma4_mtp.training_step import locate_target_parts
+    from gemma4_mtp import target_cache as tc
 
     ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
     if ddp:
@@ -77,7 +88,15 @@ def main():
         if rank == 0:
             print(*a, flush=True)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    # Rank 0 prepares the (empty) output dir + _tmp/; all ranks wait, then each
+    # rank writes into its own _tmp/rank_N/ so shards never collide.
+    if rank == 0:
+        tc.prepare_output_dir(args.out_dir)
+    if ddp:
+        dist.barrier()
+    rank_dir = os.path.join(args.out_dir, "_tmp", f"rank_{rank}")
+    os.makedirs(rank_dir, exist_ok=True)
+
     dtype = torch.bfloat16 if args.bf16 else torch.float32
 
     log(f"=== Loading target (world={world}) ===")
@@ -90,87 +109,123 @@ def main():
 
     parser = Gemma4ConversationParser(tok, max_length=args.max_length)
 
-    # Load + tokenize all rows (cheap vs target forward), then shard by rank.
-    # Each rank only tokenizes + caches ITS OWN shard: the usable-row global
-    # index (uidx) is assigned in file order; rank owns uidx % world == rank.
-    # This makes tokenization 8x parallel instead of every rank tokenizing all
-    # rows (the cause of the slow silent "Tokenizing rows" stage).
+    writer = tc.AsyncCacheWriter(
+        rank_dir=rank_dir,
+        max_shard_bytes=args.max_shard_bytes,
+        max_queue_size=args.max_queue_size,
+    )
+
+    hidden_size = num_kv_heads = head_dim = None
     log(f"=== Rank {rank}: tokenizing + caching own shard ===")
     uidx = -1          # global index over USABLE rows
     done = 0
-    mine = 0
-    for obj in iter_jsonl(args.data):
-        if obj.get("status") not in (None, "success"):
-            continue
-        conv = obj.get("conversations")
-        if not conv:
-            continue
-        uidx += 1
-        if args.limit and uidx >= args.limit:
-            break
-        if uidx % world != rank:
-            continue          # not our shard — skip tokenization entirely
-        out_path = os.path.join(args.out_dir, f"sample_{uidx:07d}.pt")
-        mine += 1
-        if os.path.exists(out_path):
+    try:
+        for obj in iter_jsonl(args.data):
+            if obj.get("status") not in (None, "success"):
+                continue
+            conv = obj.get("conversations")
+            if not conv:
+                continue
+            uidx += 1
+            if args.limit and uidx >= args.limit:
+                break
+            if uidx % world != rank:
+                continue          # not our shard — skip tokenization entirely
+            try:
+                parsed = parser.parse(conv)
+            except Exception:
+                continue
+            if int(parsed["loss_mask"].sum()) == 0:
+                continue
+            input_ids = parsed["input_ids"].unsqueeze(0).to(device)     # (1, T)
+            attn = parsed["attention_mask"].unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                base_out = target_base(
+                    input_ids=input_ids, attention_mask=attn,
+                    return_shared_kv_states=True, use_cache=False)
+                last_hidden = base_out.last_hidden_state[0]              # (T, H)
+                skv = base_out.shared_kv_states
+                fk, fv = skv["full_attention"]        # each (1, Hkv, T, D)
+                sk, sv = skv["sliding_attention"]
+
+            if hidden_size is None:
+                hidden_size = int(last_hidden.shape[-1])
+                num_kv_heads = int(fk.shape[1])
+                head_dim = int(fk.shape[-1])
+
+            # write_sample converts to CPU bytes off the GPU thread; slice batch
+            # dim off the KV so they are (Hkv, T, D).
+            writer.write_sample(
+                input_ids=parsed["input_ids"],
+                loss_mask=parsed["loss_mask"],
+                last_hidden=last_hidden,
+                kv_full_k=fk[0], kv_full_v=fv[0],
+                kv_slide_k=sk[0], kv_slide_v=sv[0],
+            )
             done += 1
-            continue
-        try:
-            parsed = parser.parse(conv)
-        except Exception:
-            continue
-        if int(parsed["loss_mask"].sum()) == 0:
-            continue
-        input_ids = parsed["input_ids"].unsqueeze(0).to(device)     # (1, T)
-        attn = parsed["attention_mask"].unsqueeze(0).to(device)
+            if rank == 0 and done % 50 == 0:
+                print(f"[rank0] cached {done}", flush=True)
+    finally:
+        writer.close()
 
-        with torch.no_grad():
-            base_out = target_base(
-                input_ids=input_ids, attention_mask=attn,
-                return_shared_kv_states=True, use_cache=False)
-            last_hidden = base_out.last_hidden_state[0]              # (T, H)
-            skv = base_out.shared_kv_states
-            # NO logits stored: target_logits = lm_head(last_hidden) is a single
-            # matmul recomputed at train time, only on mask==1 positions. lm_head
-            # is frozen (tied to embed), so this is cheap + gives the FULL
-            # distribution (better than a top-K approximation).
-
-            rec = {
-                "input_ids": parsed["input_ids"].to(torch.int32),
-                "loss_mask": parsed["loss_mask"].to(torch.int8),
-                "last_hidden": last_hidden.to(torch.bfloat16).cpu(),
-            }
-            # shared_kv: {"full_attention": (K,V), "sliding_attention": (K,V)}
-            # each K/V shape (1, Hkv, T, D) -> store (Hkv, T, D).
-            fk, fv = skv["full_attention"]
-            sk, sv = skv["sliding_attention"]
-            rec["kv_full_k"] = fk[0].to(torch.bfloat16).cpu()
-            rec["kv_full_v"] = fv[0].to(torch.bfloat16).cpu()
-            rec["kv_slide_k"] = sk[0].to(torch.bfloat16).cpu()
-            rec["kv_slide_v"] = sv[0].to(torch.bfloat16).cpu()
-
-        tmp = out_path + ".tmp"
-        torch.save(rec, tmp)
-        os.replace(tmp, out_path)
-        done += 1
-        if rank == 0 and done % 50 == 0:
-            print(f"[rank0] cached {done} (shard {mine})", flush=True)
+    # Per-rank summary for the global merge. source_sample_start=rank gives a
+    # deterministic rank ordering (samples are interleaved by modulo sharding;
+    # training shuffles, so the global ordering is irrelevant).
+    import json
+    summary = tc.LocalWriteSummary(
+        global_rank=rank,
+        source_sample_start=rank,
+        source_sample_end=rank + 1,
+        num_local_samples=writer.num_local_samples,
+        num_local_shards=len(writer.local_shard_files),
+        local_shard_files=list(writer.local_shard_files),
+    )
+    with open(os.path.join(rank_dir, "summary.json"), "w") as f:
+        json.dump(summary.to_json(), f, indent=2)
 
     log(f"=== Rank {rank} done: {done} samples ===")
+
+    # Broadcast tensor dims to rank 0 (a rank with 0 samples has None); pick any
+    # rank's dims via all_reduce max (dims are identical across ranks).
     if ddp:
+        dims = torch.tensor(
+            [hidden_size or 0, num_kv_heads or 0, head_dim or 0],
+            device=device, dtype=torch.long)
+        dist.all_reduce(dims, op=dist.ReduceOp.MAX)
+        hidden_size, num_kv_heads, head_dim = (int(dims[0]), int(dims[1]), int(dims[2]))
         dist.barrier()
-        if rank == 0:
-            import glob
-            n_files = len(glob.glob(os.path.join(args.out_dir, "sample_*.pt")))
-            meta = {
+
+    if rank == 0:
+        summaries = []
+        for r in range(world):
+            r_dir = os.path.join(args.out_dir, "_tmp", f"rank_{r}")
+            summaries.append(tc.load_local_summary(r_dir))
+        shard_map, shards = tc.build_global_shard_map(summaries)
+        for summary_json in summaries:
+            r_dir = os.path.join(args.out_dir, "_tmp",
+                                 f"rank_{int(summary_json['global_rank'])}")
+            tc.rename_local_shards(output_dir=args.out_dir, rank_dir=r_dir,
+                                   summary=summary_json, shard_map=shard_map)
+        num_samples = tc.finalize_index(
+            output_dir=args.out_dir, summaries=summaries, shard_map=shard_map)
+        manifest = tc.build_manifest(
+            num_samples=num_samples, shards=shards,
+            hidden_size=hidden_size, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            extra_fields={
                 "data": args.data,
-                "num_samples": n_files,
                 "max_length": args.max_length,
                 "dtype": "bf16" if args.bf16 else "fp32",
-            }
-            with open(os.path.join(args.out_dir, "cache_meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
-            print(f"[done] cache at {args.out_dir} ({n_files} samples)", flush=True)
+                "target_model_name_or_path": args.target,
+            },
+        )
+        tc.write_manifest(output_dir=args.out_dir, manifest=manifest)
+        tc.cleanup_tmp_dir(args.out_dir)
+        print(f"[done] cache at {args.out_dir} "
+              f"({num_samples} samples, {len(shards)} shards)", flush=True)
+
+    if ddp:
+        dist.barrier()
         dist.destroy_process_group()
 
 
