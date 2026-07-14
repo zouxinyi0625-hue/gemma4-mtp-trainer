@@ -130,39 +130,48 @@ def main():
             max_hidden_diff = max(max_hidden_diff,
                                   (out.last_hidden_state - rec["out_last_hidden"]).abs().max().item())
 
-    # (B) Recipe reconstruction: for each recorded sub-step, rebuild inputs_embeds
-    # from our recipe and confirm it equals the official inputs_embeds. We recover
-    # the token embedding as official_inputs_embeds[..., :H] and the hidden as
-    # [..., H:], then check that feeding concat(target_embed(argmax_prev), our_hidden)
-    # reproduces the official left/right split conventions.
-    recipe_left_matches = True
-    recipe_width_ok = True
+    # (B) Recipe reconstruction — PRECISE diagnostic.
+    # For each recorded sub-step, take the left half of the official inputs_embeds
+    # and compare it to a RAW target embedding. We identify the consumed token by
+    # nearest cosine match (direction is scale-invariant, so this is robust), then
+    # report the magnitude RATIO |left| / |raw_embed(token)|. Ratio ~1.0 => raw
+    # embedding (our recipe correct). Ratio ~sqrt(H)=53 => an extra normalizer.
+    W = target_embed.weight                                  # (V, H)
+    Wn = W / W.norm(dim=-1, keepdim=True).clamp(min=1e-6)     # unit rows
+    ratios = []
+    cos_matches = []
+    exact_matches = 0
     with torch.no_grad():
         for rec in records:
             ie = rec["inputs_embeds"]
             if ie.shape[-1] != 2 * H:
                 recipe_width_ok = False
                 continue
-            # The right half must be a hidden state that, per our recipe, comes
-            # either from the target (step 0) or the previous assistant backbone
-            # hidden (step j). The left half must be a RAW target embedding of the
-            # consumed token (no extra normalizer). We verify the left half lies in
-            # the row-space of target_embed by checking it equals target_embed of
-            # its nearest token id (exact for a real embedding lookup).
-            left = ie[..., :H]                                   # (1,1,H)
-            # nearest token by dot-product with embedding matrix
-            W = target_embed.weight                              # (V,H)
-            tok_id = (left.view(-1, H) @ W.t()).argmax(dim=-1)   # (1,)
-            reconstructed = target_embed(tok_id.view(1, 1))      # (1,1,H)
-            d = (reconstructed - left).abs().max().item()
-            if d > max(args.atol, 1e-2):
-                recipe_left_matches = False
+            left = ie[..., :H].reshape(-1, H).float()        # (1,H)
+            ln = left.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            # cosine nearest token (scale invariant)
+            cos = (left / ln) @ Wn.t().float()               # (1,V)
+            best = cos.argmax(dim=-1)                          # (1,)
+            cos_matches.append(cos.max().item())
+            raw = target_embed(best.view(1, 1)).reshape(-1, H).float()  # (1,H)
+            ratio = (left.norm() / raw.norm().clamp(min=1e-6)).item()
+            ratios.append(ratio)
+            if (raw - left).abs().max().item() <= max(args.atol, 1e-2):
+                exact_matches += 1
+
+    import statistics
+    mean_ratio = statistics.mean(ratios) if ratios else float("nan")
+    mean_cos = statistics.mean(cos_matches) if cos_matches else float("nan")
+    recipe_left_matches = exact_matches == len(records) and len(records) > 0
 
     print(f"  captured steps            : {len(records)}")
     print(f"  max |logits diff| (A)     : {max_logit_diff:.3e}")
     print(f"  max |hidden diff| (A)     : {max_hidden_diff:.3e}")
     print(f"  inputs_embeds width == 2H : {recipe_width_ok} (H={H})")
-    print(f"  left half == raw embed (B): {recipe_left_matches}")
+    print(f"  left-half exact==raw embed: {exact_matches}/{len(records)}")
+    print(f"  mean |left|/|raw| ratio   : {mean_ratio:.4f}  "
+          f"(1.0=raw embed, {H**0.5:.1f}=has normalizer)")
+    print(f"  mean cosine to nearest tok: {mean_cos:.4f}  (1.0=perfect direction)")
 
     ok_A = max_logit_diff <= args.atol and max_hidden_diff <= args.atol
     print("\n=== VERDICT ===")
