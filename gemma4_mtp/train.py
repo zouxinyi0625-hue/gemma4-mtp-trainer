@@ -47,7 +47,7 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--warmup-steps", type=int, default=100)
-    ap.add_argument("--max-length", type=int, default=2048)
+    ap.add_argument("--max-length", type=int, default=4096)
     ap.add_argument("--cache", default=None,
                     help="path to tokenized cache .pt (default: <data>.tok_ml<N>.pt); "
                          "rank0 writes it once, other ranks load it")

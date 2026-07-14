@@ -31,7 +31,7 @@ Run 8-GPU:
       --target /tmp/models/gemma4/text_only \
       --data ./data/mtp_short/train_maiprofile_short_26b.jsonl \
       --out-dir $MNT/mtp_cache/20260615/short_train \
-      --max-length 2048 --bf16
+      --max-length 4096 --bf16
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def parse_args():
     ap.add_argument("--target", required=True)
     ap.add_argument("--data", required=True, help="conversations JSONL")
     ap.add_argument("--out-dir", required=True, help="cache output dir (mount ok)")
-    ap.add_argument("--max-length", type=int, default=2048)
+    ap.add_argument("--max-length", type=int, default=4096)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="cap #samples (debug)")
     return ap.parse_args()

@@ -151,7 +151,7 @@ def main():
           flush=True)
 
     print("=== Loading data ===", flush=True)
-    data_cfg = DataConfig(max_length=2048)
+    data_cfg = DataConfig(max_length=4096)
     dataset = build_dataset(args.data, tokenizer, data_cfg)
     num_samples = min(args.num_samples, len(dataset))
     print(f"  evaluating {num_samples} samples, spec_tokens={args.spec_tokens}", flush=True)

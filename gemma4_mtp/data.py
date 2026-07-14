@@ -35,7 +35,7 @@ GEMMA4_ASSISTANT_LOSS_PREFIX = "<|channel>thought\n<channel|>"
 
 @dataclass
 class DataConfig:
-    max_length: int = 2048
+    max_length: int = 4096
     # Drop samples with no supervised tokens (all-prompt / parse failures).
     drop_empty_loss_mask: bool = True
     # Only keep rows with this status (generate_train_data.py sets "success").
@@ -50,7 +50,7 @@ class Gemma4ConversationParser:
     to token indices by re-encoding prefixes (robust to tokenizer merges).
     """
 
-    def __init__(self, tokenizer, max_length: int = 2048):
+    def __init__(self, tokenizer, max_length: int = 4096):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.assistant_loss_prefix = GEMMA4_ASSISTANT_LOSS_PREFIX
