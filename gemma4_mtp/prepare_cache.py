@@ -93,7 +93,11 @@ def main():
     # Load + tokenize all rows (cheap vs target forward), then shard by rank.
     log("=== Tokenizing rows ===")
     rows = []
+    seen = 0
     for obj in iter_jsonl(args.data):
+        seen += 1
+        if rank == 0 and seen % 2000 == 0:
+            print(f"[rank0] read {seen} rows, {len(rows)} kept", flush=True)
         if obj.get("status") not in (None, "success"):
             continue
         conv = obj.get("conversations")
