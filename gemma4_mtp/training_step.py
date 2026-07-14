@@ -249,3 +249,104 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
     metrics["loss"] = total_loss.detach()
     return total_loss, metrics
+
+
+def _step_loss_topk(draft_logits, topk_vals, topk_idx, hard_targets, mask, cfg):
+    """Soft-CE against a TOP-K target distribution + optional hard-CE.
+
+    cache stores only the target's top-K logits (values + token indices) instead
+    of the full 262144-wide distribution. We reconstruct a sparse soft target
+    over those K tokens (softmax of the K values) and compute cross-entropy of
+    the draft's log-probs gathered at those K indices. This is the memory-safe,
+    disk-cheap distillation used with the offline cache.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    temp = cfg.temperature
+    B, L, V = draft_logits.shape
+    flat_mask = mask.reshape(-1).bool()
+    n_sup = int(flat_mask.sum())
+    if n_sup == 0:
+        z = draft_logits.sum() * 0.0
+        return z, {"soft_ce": z.detach()}
+
+    d_flat = draft_logits.reshape(-1, V)[flat_mask]           # (n_sup, V)
+    vals = topk_vals.reshape(-1, topk_vals.size(-1))[flat_mask]  # (n_sup, K)
+    idx = topk_idx.reshape(-1, topk_idx.size(-1))[flat_mask]     # (n_sup, K)
+
+    with torch.no_grad():
+        soft_t = F.softmax(vals.float() / temp, dim=-1)        # (n_sup, K)
+    d_logp = F.log_softmax(d_flat / temp, dim=-1)              # (n_sup, V)
+    d_logp_k = torch.gather(d_logp, 1, idx.long())            # (n_sup, K)
+    soft_ce = -(soft_t * d_logp_k).sum(dim=-1).mean() * (temp * temp)
+
+    total = cfg.soft_ce_weight * soft_ce
+    out = {"soft_ce": soft_ce.detach()}
+    if cfg.hard_ce_weight > 0:
+        ht = hard_targets.reshape(-1)[flat_mask]
+        hard_ce = F.cross_entropy(d_flat, ht)
+        total = total + cfg.hard_ce_weight * hard_ce
+        out["hard_ce"] = hard_ce.detach()
+    return total, out
+
+
+def training_step_from_cache(assistant, target_embed, batch, cfg: MTPLossConfig):
+    """TTT training step using PRECOMPUTED target signals (no 26B forward).
+
+    batch (from the cache collate) provides:
+      input_ids   (B, T)          loss_mask   (B, T)
+      last_hidden (B, T, H)        shared_kv_states dict of (K,V)
+      topk_vals   (B, T, Kk)       topk_idx    (B, T, Kk)   [optional]
+    Only the assistant is run; the target never touches the GPU here.
+    """
+    import torch
+
+    input_ids = batch["input_ids"]
+    loss_mask = batch["loss_mask"]
+    last_hidden = batch["last_hidden"]
+    shared_kv_states = batch["shared_kv_states"]
+    topk_vals = batch.get("topk_vals")
+    topk_idx = batch.get("topk_idx")
+    B, T = input_ids.shape
+
+    weights = compute_step_weights(cfg)
+    K = cfg.ttt_steps
+    total_loss = torch.zeros((), device=input_ids.device)
+    metrics: dict[str, object] = {}
+    hidden = last_hidden
+
+    for k in range(K):
+        L = T - k - 1
+        if L <= 0:
+            break
+        token_ids_k = input_ids[:, k:k + L]
+        hidden_k = hidden[:, :L, :]
+        draft_logits, backbone_hidden = _assistant_step(
+            assistant, target_embed, None, token_ids_k, hidden_k,
+            shared_kv_states, None)
+        hard_targets_k = input_ids[:, k + 1:k + 1 + L]
+        mask_k = loss_mask[:, k + 1:k + 1 + L]
+
+        if topk_vals is not None:
+            vals_k = topk_vals[:, k:k + L, :]
+            idx_k = topk_idx[:, k:k + L, :]
+            step_loss, sm = _step_loss_topk(
+                draft_logits, vals_k, idx_k, hard_targets_k, mask_k, cfg)
+        else:
+            # hard-CE only path
+            cfg_hard = cfg
+            step_loss, sm = _step_loss_topk(
+                draft_logits, draft_logits[..., :1] * 0, hard_targets_k.unsqueeze(-1),
+                hard_targets_k, mask_k, cfg)
+        total_loss = total_loss + weights[k] * step_loss
+        metrics[f"step{k}_soft_ce"] = sm["soft_ce"]
+        if "hard_ce" in sm:
+            metrics[f"step{k}_hard_ce"] = sm["hard_ce"]
+
+        if k + 1 < K:
+            pad = last_hidden[:, L:, :]
+            hidden = torch.cat([backbone_hidden, pad], dim=1)
+
+    metrics["loss"] = total_loss.detach()
+    return total_loss, metrics
