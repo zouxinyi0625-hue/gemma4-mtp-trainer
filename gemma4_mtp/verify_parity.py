@@ -141,6 +141,7 @@ def main():
     ratios = []
     cos_matches = []
     exact_matches = 0
+    recipe_width_ok = True
     with torch.no_grad():
         for rec in records:
             ie = rec["inputs_embeds"]
