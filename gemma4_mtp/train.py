@@ -103,26 +103,58 @@ def set_trainable(target, assistant):
 def main():
     args = parse_args()
     import torch
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
     from gemma4_mtp.data import DataConfig, build_dataset, collate
     from gemma4_mtp.training_step import MTPLossConfig, training_step
 
+    # --- Distributed setup (torchrun sets RANK/LOCAL_RANK/WORLD_SIZE) ---
+    ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        device = args.device
+    is_main = rank == 0
+
+    def log(*a, **k):
+        if is_main:
+            print(*a, **k, flush=True)
+
     os.makedirs(args.output, exist_ok=True)
     dtype = torch.bfloat16 if args.bf16 else torch.float32
 
-    print("=== Loading models ===", flush=True)
+    log(f"=== Loading models (world_size={world_size}) ===")
     tokenizer = AutoTokenizer.from_pretrained(args.target, trust_remote_code=True)
+    # Each rank loads its OWN full copy onto its own GPU (data parallel).
+    # device_map is a single device here (NOT "auto") so DDP owns placement.
     target = AutoModelForCausalLM.from_pretrained(
-        args.target, dtype=dtype, device_map=args.device, trust_remote_code=True,
-    )
+        args.target, dtype=dtype, trust_remote_code=True,
+    ).to(device)
     assistant = AutoModelForCausalLM.from_pretrained(
-        args.assistant, dtype=dtype, device_map=args.device, trust_remote_code=True,
-    )
+        args.assistant, dtype=dtype, trust_remote_code=True,
+    ).to(device)
     trainable = set_trainable(target, assistant)
 
-    print("=== Building dataset ===", flush=True)
+    # Wrap the assistant (the only thing being trained) in DDP.
+    if ddp:
+        assistant = DDP(assistant, device_ids=[local_rank],
+                        find_unused_parameters=True)
+    # training_step expects the raw module interface; keep a handle to unwrap.
+    assistant_module = assistant.module if ddp else assistant
+
+    log("=== Building dataset ===")
     data_cfg = DataConfig(max_length=args.max_length)
     dataset = build_dataset(args.data, tokenizer, data_cfg)
     if len(dataset) == 0:
@@ -130,8 +162,11 @@ def main():
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                 shuffle=True) if ddp else None
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
+        dataset, batch_size=args.batch_size, shuffle=(sampler is None),
+        sampler=sampler,
         collate_fn=lambda b: collate(b, pad_token_id=pad_id),
     )
 
@@ -149,16 +184,27 @@ def main():
     sched = get_cosine_schedule_with_warmup(
         optim, num_warmup_steps=args.warmup_steps, num_training_steps=max(total_steps, 1))
 
-    print(f"=== Training: {len(dataset)} samples, {len(loader)} batches/epoch, "
-          f"~{total_steps} optim steps ===", flush=True)
+    log(f"=== Training: {len(dataset)} samples, {len(loader)} batches/epoch/rank, "
+        f"~{total_steps} optim steps ===")
     assistant.train()
     step = 0
     optim.zero_grad()
     for epoch in range(args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         for i, batch in enumerate(loader):
-            batch = {k: v.to(args.device) for k, v in batch.items()}
-            loss, metrics = training_step(target, assistant, batch, loss_cfg)
-            (loss / args.grad_accum).backward()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            # DDP syncs grads on the backward of the LAST micro-step only.
+            is_accum_step = (i + 1) % args.grad_accum != 0
+            if ddp and is_accum_step:
+                with assistant.no_sync():
+                    loss, metrics = training_step(
+                        target, assistant_module, batch, loss_cfg)
+                    (loss / args.grad_accum).backward()
+            else:
+                loss, metrics = training_step(
+                    target, assistant_module, batch, loss_cfg)
+                (loss / args.grad_accum).backward()
 
             if (i + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -170,17 +216,25 @@ def main():
                 if step % args.log_every == 0:
                     lr = sched.get_last_lr()[0]
                     msg = " ".join(f"{k}={float(v):.4f}" for k, v in metrics.items())
-                    print(f"epoch {epoch} step {step}/{total_steps} lr={lr:.2e} {msg}",
-                          flush=True)
-                if args.save_every and step % args.save_every == 0:
-                    _save(assistant, tokenizer, os.path.join(args.output, f"step{step}"))
+                    log(f"epoch {epoch} step {step}/{total_steps} lr={lr:.2e} {msg}")
+                if is_main and args.save_every and step % args.save_every == 0:
+                    _save(assistant_module, tokenizer,
+                          os.path.join(args.output, f"step{step}"))
                 if args.max_steps and step >= args.max_steps:
-                    print("[stop] reached --max-steps", flush=True)
-                    _save(assistant, tokenizer, args.output)
+                    log("[stop] reached --max-steps")
+                    if is_main:
+                        _save(assistant_module, tokenizer, args.output)
+                    if ddp:
+                        dist.barrier()
+                        dist.destroy_process_group()
                     return
 
-    _save(assistant, tokenizer, args.output)
-    print("=== Done ===", flush=True)
+    if is_main:
+        _save(assistant_module, tokenizer, args.output)
+    log("=== Done ===")
+    if ddp:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _save(assistant, tokenizer, path):
