@@ -105,16 +105,24 @@ def main():
             target(input_ids=input_ids, use_cache=False).logits
         return lh, skv, logits
 
-    def draft_propose(t0_id, last_hidden_vec, shared_kv):
-        """Propose k tokens autoregressively. Returns list of token ids."""
+    def draft_propose(t0_id, last_hidden_vec, shared_kv, draft_pos):
+        """Propose k tokens autoregressively. Returns list of token ids.
+
+        draft_pos: absolute position id for the draft query. vLLM uses
+        constant_draft_positions=True, so ALL draft steps query at the same
+        position — right after the last verified token. position_ids=None would
+        default to 0 and mis-align RoPE vs shared_kv (which sits at the true
+        sequence positions), destroying acceptance.
+        """
         drafts = []
         hidden = last_hidden_vec  # (1, 1, H)
         tok_id = t0_id            # (1, 1)
+        pos = torch.tensor([[draft_pos]], device=device)  # (1,1), constant
         for _ in range(k):
             tok_embed = target_embed(tok_id) * normalizer          # (1,1,H)
             combined = torch.cat([tok_embed, hidden], dim=-1)      # (1,1,2H)
             out = assistant(inputs_embeds=combined, shared_kv_states=shared_kv,
-                            position_ids=None, attention_mask=None)
+                            position_ids=pos, attention_mask=None)
             hidden = out.last_hidden_state                          # (1,1,H)
             nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1,1)
             drafts.append(int(nxt.item()))
@@ -142,8 +150,11 @@ def main():
                 continue
 
             # Draft proposes k tokens from the last position's hidden state.
+            # The draft query sits at the position of t0 = index ids.size(1)
+            # (0-indexed absolute position), held constant across draft steps.
             last_hidden_vec = last_hidden[:, -1:, :]  # (1,1,H)
-            drafts = draft_propose(t0, last_hidden_vec, shared_kv)
+            draft_pos = ids.size(1)
+            drafts = draft_propose(t0, last_hidden_vec, shared_kv, draft_pos)
             total_drafts += k
 
             # Verify: run target over [ids + t0 + drafts], compare greedy.
