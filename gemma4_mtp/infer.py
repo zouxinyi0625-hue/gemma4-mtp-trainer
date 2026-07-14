@@ -54,6 +54,10 @@ def parse_args():
     ap.add_argument("--official", action="store_true",
                     help="use transformers' built-in Gemma4 MTP spec decoding "
                          "(ground-truth reference) instead of our manual loop")
+    ap.add_argument("--compare", action="store_true",
+                    help="after the manual loop, assert its output matches the "
+                         "official assisted generate and plain target greedy "
+                         "(spec decoding is lossless, so they must be identical)")
     return ap.parse_args()
 
 
@@ -242,14 +246,13 @@ def main():
     if args.compare:
         import torch as _t
         n = gen_ids.shape[0]
+        prompt_ids = tok(text, return_tensors="pt").input_ids.to(device)
         with _t.no_grad():
             official = target.generate(
-                _t.cat([ids[:, :prompt_len]], dim=1) if False else
-                tok(text, return_tensors="pt").input_ids.to(device),
-                assistant_model=assistant, max_new_tokens=n, do_sample=False)
-            plain = target.generate(
-                tok(text, return_tensors="pt").input_ids.to(device),
+                prompt_ids, assistant_model=assistant,
                 max_new_tokens=n, do_sample=False)
+            plain = target.generate(
+                prompt_ids, max_new_tokens=n, do_sample=False)
         off_ids = official[0, prompt_len:prompt_len + n]
         pln_ids = plain[0, prompt_len:prompt_len + n]
         m = min(n, off_ids.shape[0], pln_ids.shape[0])

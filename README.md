@@ -32,10 +32,16 @@ input. It consumes intermediate tensors from the target model. All of the
 following was confirmed by running `scripts/debug_gemma_assistant.py` against
 `/tmp/models/gemma4/text_only` + `/tmp/models/gemma4/assistant`:
 
-- **`inputs_embeds`** = `concat(target_last_hidden, target_last_hidden)` along
-  the last dim → width `2 * 2816 = 5632`, which `pre_projection` maps to 1024.
-  (The simplest recipe — duplicate the final hidden state — is the correct one;
-  verified: the assistant forward succeeded with `concat(last, last)`.)
+- **`inputs_embeds`** = `concat(target_embed(token), target_hidden)` along the
+  last dim → width `2 * 2816 = 5632`, which `pre_projection` maps to 1024. The
+  debug script confirmed the assistant forward *accepts* `concat(last, last)`,
+  but the **correct** recipe (proven bit-for-bit against the official
+  speculative-decoding path in `gemma4_mtp/verify_parity.py`) is
+  `concat(target_embed(token), hidden)`: the left half is the TARGET's
+  backbone-dim token embedding, the right half is the recurrent hidden
+  (`target_last_hidden` at step 0, the assistant's own `backbone_hidden`
+  thereafter). `target_embed` is a `Gemma4TextScaledWordEmbedding` that already
+  applies `sqrt(hidden_size)`, so **no extra normalizer** is added.
 - **`shared_kv_states`** = the target base model's per-layer-type shared KV,
   obtained by calling the target base forward with
   **`return_shared_kv_states=True`**. It is a dict:
@@ -44,24 +50,30 @@ following was confirmed by running `scripts/debug_gemma_assistant.py` against
   `Gemma4Model` DOES populate this when the flag is passed — **no need for the
   unified model**.
 - Assistant output: `logits` of shape `(B, T, 262144)` (full vocab) and
-  `last_hidden_state` of shape `(B, T, 2816)`.
+  `last_hidden_state` of shape `(B, T, 2816)` (the `backbone_hidden` fed back in
+  during the multi-step TTT unroll).
 
-Flow:
+Flow (multi-step TTT, matching vLLM's autoregressive draft loop):
 
 ```
 target base fwd (return_shared_kv_states=True)
   -> last_hidden_state (B,T,2816)
   -> shared_kv_states {sliding: (K,V), full: (K,V)}
 
-inputs_embeds = concat(last_hidden, last_hidden)  # (B,T,5632)
-assistant(inputs_embeds=..., shared_kv_states=...)
-  -> logits (B,T,262144)         # draft token distribution (lm_head tied to embed)
-  -> last_hidden_state (B,T,2816)
+step 0: token = input_ids[t],  hidden = target_last_hidden
+step j: token = draft_{j-1},   hidden = backbone_hidden from step j-1
+  inputs_embeds = concat(target_embed(token), hidden)  # (B,T,5632)
+  assistant(inputs_embeds=..., shared_kv_states=<constant>, position_ids=...)
+    -> logits (B,T,262144)          # draft token distribution
+    -> last_hidden_state (B,T,2816) # backbone_hidden, fed into step j+1
 ```
 
 Consequence for training: run the target base **once per sample** to produce
-`last_hidden_state` + `shared_kv_states`, build `inputs_embeds` by duplication,
-feed the assistant, and train it to match the target's next-token distribution.
+`last_hidden_state` + `shared_kv_states`, then unroll K draft steps (TTT),
+feeding each step its own `backbone_hidden`, and train the assistant to match
+the target's next-token distribution at each step (soft-CE / KL, per-step
+weighted). See `gemma4_mtp/verify_parity.py` for the proof this matches
+deployment, and `gemma4_mtp/training_step.py` for the loss.
 
 ## Data
 
@@ -71,17 +83,28 @@ target model, `conversations`-style JSONL. MTP fine-tuning learns the target's
 own output distribution, so training answers must be **target-regenerated**, not
 the raw human answers.
 
+Training can run **online** (target forward every step, `--data`) or from an
+**offline cache** (`prepare_cache.py` precomputes the frozen target's per-sample
+`last_hidden` + shared KV once into a sharded on-mount store, then
+`train.py --cache-dir` runs only the small assistant). See
+`gemma4_mtp/target_cache.py`.
+
 ## Status
 
 - [x] Repo scaffold + README
 - [x] `scripts/debug_gemma_assistant.py` — interface VERIFIED on server
-- [x] Core training step — `gemma4_mtp/training_step.py` (single-step
-      distillation; soft-CE/KL to target). Local logic tests green.
+- [x] `gemma4_mtp/verify_parity.py` — training-time forward proven bit-for-bit
+      identical to the official spec-decoding path (recipe + KV interaction)
+- [x] Core training step — `gemma4_mtp/training_step.py` (multi-step TTT
+      distillation; soft-CE/KL to target, per-step weighted). Local logic tests
+      green.
 - [x] Data pipeline — `gemma4_mtp/data.py` (MAI Profile conversations ->
-      input_ids/loss_mask, DSpark-compatible masking). Local tests green.
-- [x] Training loop — `gemma4_mtp/train.py` (freeze target + assistant
-      lm_head/embed; train the 4 decoder layers + projections; AdamW + cosine;
-      export stock-config checkpoint for vLLM). Freeze policy unit-tested.
+      input_ids/loss_mask, DSpark-compatible masking) + `target_cache.py`
+      (offline sharded cache). Local logic tests green.
+- [x] Training loop — `gemma4_mtp/train.py` (online + cache modes; freeze
+      target + assistant lm_head/embed; train the 4 decoder layers + projections;
+      AdamW + cosine; export stock-config checkpoint for vLLM). Freeze policy
+      unit-tested.
 - [ ] **Server run**: train on MAI Profile data, export, benchmark vs the stock
       assistant on the vllm-msn scaffold (real acceptance/tok-s numbers).
 
