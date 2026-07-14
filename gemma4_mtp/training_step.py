@@ -126,7 +126,12 @@ def _assistant_step(assistant, target_embed, normalizer, token_ids, hidden,
     """
     import torch
 
-    tok_embed = target_embed(token_ids) * normalizer          # (B, T, H)
+    # NO manual normalizer: Gemma4's get_input_embeddings() is a
+    # Gemma4TextScaledWordEmbedding that already multiplies by sqrt(hidden_size)
+    # internally (embed_scale). Multiplying again would over-scale by ~53x and
+    # destroy the draft (confirmed vs transformers v5.13.0 modeling_gemma4
+    # line 1608 + official SinglePositionMultiTokenCandidateGenerator).
+    tok_embed = target_embed(token_ids)                       # (B, T, H)
     combined = torch.cat([tok_embed, hidden], dim=-1)          # (B, T, 2H)
     out = assistant(
         inputs_embeds=combined,

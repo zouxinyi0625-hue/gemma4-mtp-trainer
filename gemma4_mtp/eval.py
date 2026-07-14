@@ -220,7 +220,7 @@ def main():
                     # Recursive recipe (vLLM gemma4_mtp.py):
                     # inputs_embeds = embed(tok) * sqrt(backbone_dim)
                     # combined = cat(inputs_embeds, hidden_states)
-                    tok_embed = target_embed(tok) * normalizer  # (1, 1, 2816)
+                    tok_embed = target_embed(tok)  # (1,1,2816) NO normalizer (embed_scale built in)
                     combined = torch.cat([tok_embed, backbone_h], dim=-1)  # (1, 1, 5632)
 
                     # Run the assistant forward
