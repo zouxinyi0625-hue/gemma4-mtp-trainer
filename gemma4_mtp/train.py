@@ -36,6 +36,9 @@ def parse_args():
     ap.add_argument("--target", required=True, help="target/verifier path or id")
     ap.add_argument("--assistant", required=True, help="assistant/draft path or id")
     ap.add_argument("--data", required=True, help="MAI Profile regenerated JSONL")
+    ap.add_argument("--cache-dir", default=None,
+                    help="if set, train from prepare_cache.py output (no 26B target "
+                         "loaded; reads precomputed hidden/kv/top-k signals)")
     ap.add_argument("--output", required=True, help="output dir for checkpoints")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch-size", type=int, default=2)
