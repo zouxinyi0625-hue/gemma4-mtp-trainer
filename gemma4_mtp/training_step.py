@@ -143,29 +143,39 @@ def _assistant_step(assistant, target_embed, normalizer, token_ids, hidden,
 
 
 def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
-    """Soft-CE (KL to target) + optional hard-CE at one aligned step."""
+    """Soft-CE (KL to target) + optional hard-CE at one aligned step.
+
+    Memory-critical: the vocab is 262144, so materializing softmax over every
+    (B, L) position blows up GPU memory (the OOM at log_softmax). Only mask==1
+    positions (assistant-response tokens) are supervised, so we GATHER those
+    rows first and compute the 262144-wide softmax ONLY on them. For long
+    prompts with short responses this cuts the softmax activation by 10x+.
+    """
     import torch
     import torch.nn.functional as F
 
     temp = cfg.temperature
+    B, L, V = draft_logits.shape
+    flat_mask = mask.reshape(-1).bool()                        # (B*L,)
+    n_sup = int(flat_mask.sum())
+    if n_sup == 0:
+        # No supervised tokens this step; return a differentiable zero.
+        z = draft_logits.sum() * 0.0
+        return z, {"soft_ce": z.detach()}
+
+    d_flat = draft_logits.reshape(-1, V)[flat_mask]            # (n_sup, V)
+    t_flat = target_logits.reshape(-1, V)[flat_mask]           # (n_sup, V)
+
     with torch.no_grad():
-        soft_t = F.softmax(target_logits / temp, dim=-1)
-    log_p = F.log_softmax(draft_logits / temp, dim=-1)
-    per_pos = -(soft_t * log_p).sum(dim=-1)                    # (B, L)
-    m = mask.to(per_pos.dtype)
-    denom = m.sum().clamp(min=1.0)
-    soft_ce = (per_pos * m).sum() / denom * (temp * temp)
+        soft_t = F.softmax(t_flat / temp, dim=-1)
+    log_p = F.log_softmax(d_flat / temp, dim=-1)
+    soft_ce = -(soft_t * log_p).sum(dim=-1).mean() * (temp * temp)
 
     total = cfg.soft_ce_weight * soft_ce
     out = {"soft_ce": soft_ce.detach()}
     if cfg.hard_ce_weight > 0:
-        ht = hard_targets.clone()
-        ht[mask == 0] = cfg.ignore_index
-        hard_ce = F.cross_entropy(
-            draft_logits.reshape(-1, draft_logits.size(-1)),
-            ht.reshape(-1),
-            ignore_index=cfg.ignore_index,
-        )
+        ht = hard_targets.reshape(-1)[flat_mask]               # (n_sup,)
+        hard_ce = F.cross_entropy(d_flat, ht)
         total = total + cfg.hard_ce_weight * hard_ce
         out["hard_ce"] = hard_ce.detach()
     return total, out
