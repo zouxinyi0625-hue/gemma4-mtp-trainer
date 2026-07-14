@@ -259,7 +259,8 @@ def collate_cache(batch, pad_token_id: int):
     """Right-pad cached samples (variable T) into batched tensors + shared_kv.
 
     Each cache record has: input_ids (T,), loss_mask (T,), last_hidden (T,H),
-    kv_{full,slide}_{k,v} (Hkv,T,D), optional topk_vals/topk_idx (T,K).
+    kv_{full,slide}_{k,v} (Hkv,T,D). Target soft labels are recomputed at train
+    time via lm_head(last_hidden), so no logits are stored or batched here.
     Padding is on the time axis; attention over pad positions is harmless because
     training supervises only loss_mask==1 (real response) positions.
     """
@@ -273,16 +274,7 @@ def collate_cache(batch, pad_token_id: int):
     loss_mask = torch.zeros((B, T), dtype=torch.long)
     last_hidden = torch.zeros((B, T, H), dtype=batch[0]["last_hidden"].dtype)
 
-    has_topk = "topk_vals" in batch[0]
-    if has_topk:
-        Kk = batch[0]["topk_vals"].shape[-1]
-        topk_vals = torch.zeros((B, T, Kk), dtype=batch[0]["topk_vals"].dtype)
-        topk_idx = torch.zeros((B, T, Kk), dtype=torch.long)
-
-    # shared_kv: pad each of full/slide K/V to (B, Hkv, T, D). Draft attends to
-    # ALL provided KV; per-sample the KV is the sample's own — with B>1 this only
-    # works if the assistant reads shared_kv per-batch-row. To keep it simple and
-    # correct, cache training uses batch_size handling where the KV is stacked.
+    # shared_kv: pad each of full/slide K/V to (B, Hkv, T, D).
     kv_shapes = {k: batch[0][k].shape for k in
                  ("kv_full_k", "kv_full_v", "kv_slide_k", "kv_slide_v")}
     kv = {k: torch.zeros((B,) + (v[0], T, v[2]), dtype=batch[0][k].dtype)
@@ -295,21 +287,14 @@ def collate_cache(batch, pad_token_id: int):
         last_hidden[i, :n] = b["last_hidden"]
         for k in kv:
             kv[k][i, :, :n, :] = b[k]
-        if has_topk:
-            topk_vals[i, :n] = b["topk_vals"]
-            topk_idx[i, :n] = b["topk_idx"].long()
 
     shared_kv_states = {
         "full_attention": (kv["kv_full_k"], kv["kv_full_v"]),
         "sliding_attention": (kv["kv_slide_k"], kv["kv_slide_v"]),
     }
-    out = {
+    return {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
         "last_hidden": last_hidden,
         "shared_kv_states": shared_kv_states,
     }
-    if has_topk:
-        out["topk_vals"] = topk_vals
-        out["topk_idx"] = topk_idx
-    return out

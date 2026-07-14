@@ -12,18 +12,18 @@ target is FROZEN, so these signals are identical every epoch. We precompute them
 ONCE here, 8-GPU data-parallel, and stream to disk (mount). train.py then reads
 the cache and only runs the small assistant — no 26B target, no OOM.
 
-Storage note (why not store full logits): full (T, 262144) logits are ~1GB/sample.
-We store only the TOP-K logits (values + indices) so soft-CE distillation still
-works at a fraction of the size. K default 64.
+Storage note (why not store logits): full (T, 262144) logits are ~1GB/sample.
+We DON'T store them at all — target soft labels are recomputed at train time as
+lm_head(last_hidden), a single frozen matmul evaluated only on supervised
+(loss_mask==1) positions. This gives the FULL distribution, not a top-K approx,
+and keeps the cache small.
 
-Per-sample cache (one .pt file, or sharded safetensors):
+Per-sample cache (one .pt file):
   input_ids      (T,)        int32
   loss_mask      (T,)        int8
   last_hidden    (T, H)      bf16
   kv_full_k/v    (Hkv, T, D) bf16   (last full-attention layer KV)
   kv_slide_k/v   (Hkv, T, D) bf16   (last sliding-attention layer KV)
-  topk_vals      (T, K)      bf16   (target top-K logit values)
-  topk_idx       (T, K)      int32  (target top-K token ids)
 
 Run 8-GPU:
   MNT=$AZURE_ML_INPUT_msndni/shares/users/zxy/maiprofile
@@ -31,7 +31,7 @@ Run 8-GPU:
       --target /tmp/models/gemma4/text_only \
       --data ./data/mtp_short/train_maiprofile_short_26b.jsonl \
       --out-dir $MNT/mtp_cache/20260615/short_train \
-      --max-length 2048 --topk 64 --bf16
+      --max-length 2048 --bf16
 """
 
 from __future__ import annotations
@@ -48,8 +48,6 @@ def parse_args():
     ap.add_argument("--data", required=True, help="conversations JSONL")
     ap.add_argument("--out-dir", required=True, help="cache output dir (mount ok)")
     ap.add_argument("--max-length", type=int, default=2048)
-    ap.add_argument("--topk", type=int, default=64,
-                    help="store top-K target logits for soft-CE (0 = hard-CE only)")
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="cap #samples (debug)")
     return ap.parse_args()
@@ -88,7 +86,7 @@ def main():
         args.target, dtype=dtype, trust_remote_code=True).to(device).eval()
     for p in target.parameters():
         p.requires_grad_(False)
-    target_base, lm_head, _, _ = locate_target_parts(target)
+    target_base, _, _, _ = locate_target_parts(target)
 
     parser = Gemma4ConversationParser(tok, max_length=args.max_length)
 
@@ -132,7 +130,10 @@ def main():
                 return_shared_kv_states=True, use_cache=False)
             last_hidden = base_out.last_hidden_state[0]              # (T, H)
             skv = base_out.shared_kv_states
-            logits = lm_head(base_out.last_hidden_state)[0]          # (T, V)
+            # NO logits stored: target_logits = lm_head(last_hidden) is a single
+            # matmul recomputed at train time, only on mask==1 positions. lm_head
+            # is frozen (tied to embed), so this is cheap + gives the FULL
+            # distribution (better than a top-K approximation).
 
             rec = {
                 "input_ids": parsed["input_ids"].to(torch.int32),
@@ -147,10 +148,6 @@ def main():
             rec["kv_full_v"] = fv[0].to(torch.bfloat16).cpu()
             rec["kv_slide_k"] = sk[0].to(torch.bfloat16).cpu()
             rec["kv_slide_v"] = sv[0].to(torch.bfloat16).cpu()
-            if args.topk > 0:
-                vals, idxs = torch.topk(logits, k=args.topk, dim=-1)  # (T, K)
-                rec["topk_vals"] = vals.to(torch.bfloat16).cpu()
-                rec["topk_idx"] = idxs.to(torch.int32).cpu()
 
         tmp = out_path + ".tmp"
         torch.save(rec, tmp)
@@ -167,7 +164,6 @@ def main():
                 "data": args.data,
                 "num_samples": len(rows),
                 "max_length": args.max_length,
-                "topk": args.topk,
                 "dtype": "bf16" if args.bf16 else "fp32",
             }
             with open(os.path.join(args.out_dir, "cache_meta.json"), "w") as f:

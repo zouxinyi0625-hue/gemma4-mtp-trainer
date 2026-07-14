@@ -158,7 +158,14 @@ def main():
         _tmp = AutoModelForCausalLM.from_pretrained(
             args.target, dtype=dtype, trust_remote_code=True)
         target_embed = _tmp.get_input_embeddings().to(device)
+        # lm_head recomputes target soft labels from cached hidden (frozen, tied).
+        target_lm_head = _tmp.get_output_embeddings()
+        if target_lm_head is None:
+            target_lm_head = getattr(_tmp, "lm_head", None)
+        target_lm_head = target_lm_head.to(device)
         for p in target_embed.parameters():
+            p.requires_grad_(False)
+        for p in target_lm_head.parameters():
             p.requires_grad_(False)
         del _tmp
         torch.cuda.empty_cache()
@@ -168,6 +175,7 @@ def main():
             args.target, dtype=dtype, trust_remote_code=True,
         ).to(device)
         target_embed = None
+        target_lm_head = None
     assistant = AutoModelForCausalLM.from_pretrained(
         args.assistant, dtype=dtype, trust_remote_code=True,
     ).to(device)
@@ -250,7 +258,7 @@ def main():
     def run_step(batch):
         if use_cache:
             return training_step_from_cache(
-                assistant_module, target_embed, batch, loss_cfg)
+                assistant_module, target_embed, target_lm_head, batch, loss_cfg)
         return training_step(target, assistant_module, batch, loss_cfg)
 
     for epoch in range(args.epochs):
