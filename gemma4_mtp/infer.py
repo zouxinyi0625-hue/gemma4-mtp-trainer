@@ -43,6 +43,8 @@ def parse_args():
     ap.add_argument("--target", required=True)
     ap.add_argument("--assistant", required=True)
     ap.add_argument("--prompt", default="Explain speculative decoding in one sentence.")
+    ap.add_argument("--system", default="You are a helpful assistant.",
+                    help="system prompt (matches the official example); '' to omit")
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--spec-tokens", type=int, default=5, help="k draft tokens/step")
     ap.add_argument("--bf16", action="store_true")
@@ -92,8 +94,11 @@ def main():
     normalizer = math.sqrt(backbone)
     print(f"  backbone_hidden={backbone}, normalizer={normalizer:.2f}", flush=True)
 
-    # Build initial input.
-    messages = [{"role": "user", "content": args.prompt}]
+    # Build initial input. Match the official example: include a system prompt.
+    messages = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+    messages.append({"role": "user", "content": args.prompt})
     text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     ids = tok(text, return_tensors="pt").input_ids.to(device)
     prompt_len = ids.size(1)
@@ -229,6 +234,40 @@ def main():
         print(f"Acceptance rate:   {total_accepted/total_drafts*100:.1f}%")
         print(f"Accept length:     {total_accepted/max(steps,1)+1:.2f}")
     print(f"{'='*50}")
+
+    # --- Correctness check: speculative decoding is LOSSLESS, so our manual
+    # output MUST equal (a) the official assisted generate and (b) plain target
+    # greedy, token-for-token. This proves our manual loop matches the official
+    # implementation, not just approximately.
+    if args.compare:
+        import torch as _t
+        n = gen_ids.shape[0]
+        with _t.no_grad():
+            official = target.generate(
+                _t.cat([ids[:, :prompt_len]], dim=1) if False else
+                tok(text, return_tensors="pt").input_ids.to(device),
+                assistant_model=assistant, max_new_tokens=n, do_sample=False)
+            plain = target.generate(
+                tok(text, return_tensors="pt").input_ids.to(device),
+                max_new_tokens=n, do_sample=False)
+        off_ids = official[0, prompt_len:prompt_len + n]
+        pln_ids = plain[0, prompt_len:prompt_len + n]
+        m = min(n, off_ids.shape[0], pln_ids.shape[0])
+        same_off = bool((gen_ids[:m] == off_ids[:m]).all().item())
+        same_pln = bool((gen_ids[:m] == pln_ids[:m]).all().item())
+        print(f"[compare] manual == official assisted : {same_off}")
+        print(f"[compare] manual == plain greedy       : {same_pln}")
+        if same_off and same_pln:
+            print("[compare] ✅ IDENTICAL — manual loop matches the official "
+                  "implementation exactly (spec decoding is lossless).")
+        else:
+            # Show first divergence for debugging.
+            for i in range(m):
+                if gen_ids[i] != off_ids[i]:
+                    print(f"[compare] first divergence at token {i}: "
+                          f"manual={gen_ids[i].item()} official={off_ids[i].item()}")
+                    break
+        print(f"{'='*50}")
     print("Note: greedy smoke test. Official numbers come from vllm-msn bench.")
 
 
