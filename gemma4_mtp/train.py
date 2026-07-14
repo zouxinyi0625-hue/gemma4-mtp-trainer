@@ -44,6 +44,9 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--warmup-steps", type=int, default=100)
     ap.add_argument("--max-length", type=int, default=2048)
+    ap.add_argument("--cache", default=None,
+                    help="path to tokenized cache .pt (default: <data>.tok_ml<N>.pt); "
+                         "rank0 writes it once, other ranks load it")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--ttt-steps", type=int, default=5,
                     help="TTT draft steps to unroll (match deployment spec_tokens)")
@@ -156,7 +159,9 @@ def main():
 
     log("=== Building dataset ===")
     data_cfg = DataConfig(max_length=args.max_length)
-    dataset = build_dataset(args.data, tokenizer, data_cfg)
+    cache_path = args.cache or (args.data + f".tok_ml{args.max_length}.pt")
+    dataset = build_dataset(args.data, tokenizer, data_cfg,
+                            cache_path=cache_path, rank=rank, world_size=world_size)
     if len(dataset) == 0:
         raise RuntimeError("empty dataset after filtering; check --data path/format")
     pad_id = tokenizer.pad_token_id

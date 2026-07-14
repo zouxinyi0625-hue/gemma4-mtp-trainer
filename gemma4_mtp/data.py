@@ -142,19 +142,8 @@ def iter_jsonl(path):
                 yield json.loads(line)
 
 
-def build_dataset(jsonl_path, tokenizer, cfg: DataConfig | None = None):
-    """Return a torch Dataset of {input_ids, attention_mask, loss_mask}.
-
-    Rows are parsed lazily-then-materialized; large corpora should stream, but
-    for a first training run we keep it simple and hold token tensors in memory
-    (they're small vs the 26B model). Raw text is not retained.
-    """
-    import torch
-    from torch.utils.data import Dataset
-
-    cfg = cfg or DataConfig()
+def _tokenize_all(jsonl_path, tokenizer, cfg):
     parser = Gemma4ConversationParser(tokenizer, max_length=cfg.max_length)
-
     samples = []
     n_total = n_skipped = 0
     for obj in iter_jsonl(jsonl_path):
@@ -175,9 +164,48 @@ def build_dataset(jsonl_path, tokenizer, cfg: DataConfig | None = None):
             n_skipped += 1
             continue
         samples.append(parsed)
-
     print(f"[data] kept {len(samples)}/{n_total} conversations "
           f"({n_skipped} skipped) from {jsonl_path}", flush=True)
+    return samples
+
+
+def build_dataset(jsonl_path, tokenizer, cfg: DataConfig | None = None,
+                  cache_path=None, rank=0, world_size=1):
+    """Return a torch Dataset of {input_ids, attention_mask, loss_mask}.
+
+    Tokenization is expensive, so we cache the materialized token tensors to
+    ``cache_path`` (a .pt file). Under DDP, only rank 0 tokenizes + writes the
+    cache; other ranks wait on a barrier and then load it — avoiding N processes
+    redundantly tokenizing the same corpus (the cause of the long GPU-idle stall
+    at startup). Pass rank/world_size from the training loop.
+    """
+    import os
+    import torch
+    import torch.distributed as dist
+    from torch.utils.data import Dataset
+
+    cfg = cfg or DataConfig()
+    ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
+
+    samples = None
+    if cache_path and os.path.exists(cache_path):
+        samples = torch.load(cache_path, weights_only=False)
+        print(f"[data] loaded {len(samples)} cached samples from {cache_path}",
+              flush=True)
+    else:
+        if not ddp or rank == 0:
+            samples = _tokenize_all(jsonl_path, tokenizer, cfg)
+            if cache_path:
+                tmp = cache_path + ".tmp"
+                torch.save(samples, tmp)
+                os.replace(tmp, cache_path)
+                print(f"[data] wrote cache -> {cache_path}", flush=True)
+        if ddp:
+            dist.barrier()  # non-main ranks wait for rank0 to finish writing
+            if rank != 0:
+                samples = torch.load(cache_path, weights_only=False)
+                print(f"[data] rank{rank} loaded {len(samples)} cached samples",
+                      flush=True)
 
     class _DS(Dataset):
         def __len__(self):
