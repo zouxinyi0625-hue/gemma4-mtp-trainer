@@ -49,6 +49,9 @@ def parse_args():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-spec", action="store_true",
                     help="disable speculation (pure target greedy) for A/B check")
+    ap.add_argument("--official", action="store_true",
+                    help="use transformers' built-in Gemma4 MTP spec decoding "
+                         "(ground-truth reference) instead of our manual loop")
     return ap.parse_args()
 
 
@@ -131,6 +134,33 @@ def main():
         return drafts
 
     print("=== Generating ===", flush=True)
+
+    # --- Official ground-truth mode: use transformers' built-in Gemma4 MTP
+    # speculative decoding (SinglePositionMultiTokenCandidateGenerator). This is
+    # the reference; compare its throughput/quality to our manual loop.
+    if args.official:
+        import time
+        gen_kwargs = dict(max_new_tokens=args.max_new_tokens, do_sample=False)
+        # First: assisted (spec decoding with the assistant).
+        t0 = time.time()
+        out_assisted = target.generate(ids, assistant_model=assistant, **gen_kwargs)
+        dt_assisted = time.time() - t0
+        n_assisted = out_assisted.shape[1] - prompt_len
+        # Second: plain target greedy for A/B.
+        t0 = time.time()
+        out_plain = target.generate(ids, **gen_kwargs)
+        dt_plain = time.time() - t0
+        text_out = tok.decode(out_assisted[0, prompt_len:], skip_special_tokens=True)
+        print(f"\n--- Official assisted output ---\n{text_out}\n", flush=True)
+        print(f"{'='*50}")
+        print(f"Assisted: {n_assisted} tok in {dt_assisted:.2f}s "
+              f"({n_assisted/dt_assisted:.1f} tok/s)")
+        print(f"Plain:    {out_plain.shape[1]-prompt_len} tok in {dt_plain:.2f}s "
+              f"({(out_plain.shape[1]-prompt_len)/dt_plain:.1f} tok/s)")
+        print(f"Speedup:  {dt_plain/dt_assisted:.2f}x")
+        print(f"{'='*50}")
+        return
+
     total_new = 0
     total_drafts = 0
     total_accepted = 0
