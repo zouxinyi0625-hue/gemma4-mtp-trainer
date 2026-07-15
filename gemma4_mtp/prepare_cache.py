@@ -75,7 +75,14 @@ def main():
 
     ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
     if ddp:
-        dist.init_process_group(backend="nccl")
+        # Large timeout: the only collectives are an early barrier (after rank0
+        # makes the output dir) — cheap — but writing the full cache to a slow
+        # mount can take a long time, and we don't want the NCCL watchdog to
+        # tear down the group during that window. Global finalize uses a
+        # filesystem poll, not a collective (see the tail of main()).
+        import datetime
+        dist.init_process_group(
+            backend="nccl", timeout=datetime.timedelta(hours=6))
         rank = int(os.environ["RANK"])
         world = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -179,7 +186,11 @@ def main():
 
     # Per-rank summary for the global merge. source_sample_start=rank gives a
     # deterministic rank ordering (samples are interleaved by modulo sharding;
-    # training shuffles, so the global ordering is irrelevant).
+    # training shuffles, so the global ordering is irrelevant). Tensor dims go
+    # in the summary too (identical across ranks; rank0 reads any one) — we do
+    # NOT use an NCCL all_reduce for this, because it would have to wait for
+    # every rank to finish its slow-mount writes and blows past the NCCL
+    # watchdog timeout when ranks finish at very different times.
     import json
     summary = tc.LocalWriteSummary(
         global_rank=rank,
@@ -188,33 +199,45 @@ def main():
         num_local_samples=writer.num_local_samples,
         num_local_shards=len(writer.local_shard_files),
         local_shard_files=list(writer.local_shard_files),
+        hidden_size=hidden_size or 0,
+        kv_dims={name: [int(kv_dims[name][0]), int(kv_dims[name][1])]
+                 for name in tc._KV_FIELDS} if kv_dims else {},
     )
-    with open(os.path.join(rank_dir, "summary.json"), "w") as f:
+    # Atomic write so rank0's poll never sees a half-written summary.
+    summary_path = os.path.join(rank_dir, "summary.json")
+    tmp_summary = summary_path + ".tmp"
+    with open(tmp_summary, "w") as f:
         json.dump(summary.to_json(), f, indent=2)
+    os.replace(tmp_summary, summary_path)
 
     log(f"=== Rank {rank} done: {done} samples ===")
 
-    # Broadcast tensor dims to all ranks (a rank with 0 samples has None); pick
-    # any rank's dims via all_reduce max (dims are identical across ranks). We
-    # flatten hidden_size + each KV field's (Hkv, D) into one tensor.
-    kv_field_order = tc._KV_FIELDS
-    if ddp:
-        flat = [hidden_size or 0]
-        for name in kv_field_order:
-            h, d = (kv_dims[name] if kv_dims else (0, 0))
-            flat += [h, d]
-        dims = torch.tensor(flat, device=device, dtype=torch.long)
-        dist.all_reduce(dims, op=dist.ReduceOp.MAX)
-        hidden_size = int(dims[0])
-        kv_dims = {name: (int(dims[1 + 2 * i]), int(dims[2 + 2 * i]))
-                   for i, name in enumerate(kv_field_order)}
-        dist.barrier()
-
+    # Global finalize on rank 0. Instead of an NCCL barrier (which times out
+    # when ranks finish slow-mount writes minutes apart), rank 0 polls the
+    # filesystem until every rank's summary.json exists. Non-zero ranks are
+    # done — they just exit after destroying the process group.
     if rank == 0:
+        import time
         summaries = []
         for r in range(world):
             r_dir = os.path.join(args.out_dir, "_tmp", f"rank_{r}")
+            r_summary = os.path.join(r_dir, "summary.json")
+            waited = 0
+            while not os.path.exists(r_summary):
+                time.sleep(5)
+                waited += 5
+                if waited % 60 == 0:
+                    print(f"[rank0] waiting for rank {r} summary "
+                          f"({waited}s)...", flush=True)
             summaries.append(tc.load_local_summary(r_dir))
+
+        # Tensor dims from any rank that actually wrote samples.
+        dim_src = next((s for s in summaries if s.get("kv_dims")), None)
+        assert dim_src is not None, "no rank produced any samples; check --data"
+        hidden_size = int(dim_src["hidden_size"])
+        kv_dims = {name: (int(h), int(d))
+                   for name, (h, d) in dim_src["kv_dims"].items()}
+
         shard_map, shards = tc.build_global_shard_map(summaries)
         for summary_json in summaries:
             r_dir = os.path.join(args.out_dir, "_tmp",
@@ -238,8 +261,10 @@ def main():
         print(f"[done] cache at {args.out_dir} "
               f"({num_samples} samples, {len(shards)} shards)", flush=True)
 
+    # No final NCCL barrier: rank0 syncs via the filesystem poll above, and a
+    # barrier here would again wait on ranks slow to reach it. Each rank tears
+    # down its own process group independently (a local op, no collective).
     if ddp:
-        dist.barrier()
         dist.destroy_process_group()
 
 

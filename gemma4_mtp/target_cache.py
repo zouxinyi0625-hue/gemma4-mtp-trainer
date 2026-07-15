@@ -172,6 +172,8 @@ class LocalWriteSummary:
     num_local_samples: int
     num_local_shards: int
     local_shard_files: list
+    hidden_size: int = 0
+    kv_dims: dict = None  # {field_name: [num_kv_heads, head_dim]}
 
     def to_json(self):
         return {
@@ -181,6 +183,8 @@ class LocalWriteSummary:
             "num_local_samples": self.num_local_samples,
             "num_local_shards": self.num_local_shards,
             "local_shard_files": list(self.local_shard_files),
+            "hidden_size": int(self.hidden_size),
+            "kv_dims": self.kv_dims or {},
         }
 
 
