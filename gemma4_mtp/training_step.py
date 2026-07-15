@@ -46,6 +46,9 @@ class MTPLossConfig:
     # Hard-CE against the ground-truth next token weight.
     hard_ce_weight: float = 0.0
     ignore_index: int = -100
+    # Rows per softmax chunk in _step_loss; bounds peak memory on batches with
+    # many supervised tokens (the 262144-wide vocab softmax is the OOM risk).
+    loss_chunk_rows: int = 1024
 
 
 def compute_step_weights(cfg: MTPLossConfig) -> list[float]:
@@ -150,6 +153,11 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
     positions (assistant-response tokens) are supervised, so we GATHER those
     rows first and compute the 262144-wide softmax ONLY on them. For long
     prompts with short responses this cuts the softmax activation by 10x+.
+
+    Even after gathering, a batch that happens to have many supervised tokens
+    (two long responses) makes (n_sup, 262144) too big for one softmax. So we
+    process the gathered rows in fixed-size CHUNKS and accumulate the loss —
+    numerically identical (mean = sum / n_sup), just bounded peak memory.
     """
     import torch
     import torch.nn.functional as F
@@ -165,17 +173,31 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
 
     d_flat = draft_logits.reshape(-1, V)[flat_mask]            # (n_sup, V)
     t_flat = target_logits.reshape(-1, V)[flat_mask]           # (n_sup, V)
+    if cfg.hard_ce_weight > 0:
+        ht_flat = hard_targets.reshape(-1)[flat_mask]          # (n_sup,)
 
-    with torch.no_grad():
-        soft_t = F.softmax(t_flat / temp, dim=-1)
-    log_p = F.log_softmax(d_flat / temp, dim=-1)
-    soft_ce = -(soft_t * log_p).sum(dim=-1).mean() * (temp * temp)
+    # Rows per softmax chunk. ~1024 rows x 262144 x 4B ~= 1GB per activation;
+    # bounds peak memory regardless of how many tokens a batch supervises.
+    chunk = int(getattr(cfg, "loss_chunk_rows", 1024))
+    soft_ce_sum = draft_logits.new_zeros(())
+    hard_ce_sum = draft_logits.new_zeros(())
+    for start in range(0, n_sup, chunk):
+        d = d_flat[start:start + chunk]                        # (c, V)
+        t = t_flat[start:start + chunk]                        # (c, V)
+        with torch.no_grad():
+            soft_t = F.softmax(t / temp, dim=-1)
+        log_p = F.log_softmax(d / temp, dim=-1)
+        # sum over vocab, sum over rows (divide by n_sup at the end -> mean).
+        soft_ce_sum = soft_ce_sum + -(soft_t * log_p).sum(dim=-1).sum() * (temp * temp)
+        if cfg.hard_ce_weight > 0:
+            hard_ce_sum = hard_ce_sum + F.cross_entropy(
+                d, ht_flat[start:start + chunk], reduction="sum")
 
+    soft_ce = soft_ce_sum / n_sup
     total = cfg.soft_ce_weight * soft_ce
     out = {"soft_ce": soft_ce.detach()}
     if cfg.hard_ce_weight > 0:
-        ht = hard_targets.reshape(-1)[flat_mask]               # (n_sup,)
-        hard_ce = F.cross_entropy(d_flat, ht)
+        hard_ce = hard_ce_sum / n_sup
         total = total + cfg.hard_ce_weight * hard_ce
         out["hard_ce"] = hard_ce.detach()
     return total, out
