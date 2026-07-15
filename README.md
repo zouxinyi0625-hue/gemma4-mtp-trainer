@@ -9,49 +9,42 @@ stock assistant in vLLM.
 This is **line 2 (the priority line)** of the draft-model acceleration project.
 See the roadmap in `vllm-msn/benchmarks/gemma4_12b_fp8/DRAFT_MODEL_ROADMAP.md`.
 
-## Why a separate repo (not speculators)
-
-The `speculators` MTP path only supports **Qwen3-style native MTP heads**
-(`qwen3_next` / `qwen3_5_*`), which it extracts from the verifier checkpoint.
-Google's Gemma 4 assistant is a **different architecture**
-(`Gemma4AssistantForCausalLM`, shipped in `transformers`), so we fine-tune it
-directly with `transformers` instead of forcing it into the speculators format.
-speculators' MTP loss / step-weight logic is used only as a *reference*.
-
 ## Target vs draft (the setup)
 
 | | model | role |
 |---|---|---|
-| Target (verifier) | `google/gemma-4-26B-A4B-it` (FP8 text-only in prod) | frozen, produces embeds + KV |
+| Target (verifier) | `google/gemma-4-26B-A4B-it` (FP8 text-only in prod) | frozen, produces embeds + KV + soft labels |
 | Draft (assistant) | `google/gemma-4-26B-A4B-it-assistant` | the thing we fine-tune |
 
-## How the Gemma 4 assistant actually works (VERIFIED on server 2026-07-08)
+We fine-tune Google's native `Gemma4AssistantForCausalLM` directly with
+`transformers` (not via speculators, which only handles Qwen3-style native MTP
+heads). speculators' MTP loss / step-weight logic is used only as a reference.
+
+## How the Gemma 4 assistant actually works
 
 `Gemma4AssistantForCausalLM.forward` does **not** take token ids as its real
-input. It consumes intermediate tensors from the target model. All of the
-following was confirmed by running `scripts/debug_gemma_assistant.py` against
-`/tmp/models/gemma4/text_only` + `/tmp/models/gemma4/assistant`:
+input — it consumes intermediate tensors from the target model. The recipe below
+is proven **bit-for-bit** against the official transformers speculative-decoding
+path (`SinglePositionMultiTokenCandidateGenerator`) by
+`gemma4_mtp/verify_parity.py`, so the training-time forward is guaranteed
+consistent with deployment.
 
-- **`inputs_embeds`** = `concat(target_embed(token), target_hidden)` along the
-  last dim → width `2 * 2816 = 5632`, which `pre_projection` maps to 1024. The
-  debug script confirmed the assistant forward *accepts* `concat(last, last)`,
-  but the **correct** recipe (proven bit-for-bit against the official
-  speculative-decoding path in `gemma4_mtp/verify_parity.py`) is
-  `concat(target_embed(token), hidden)`: the left half is the TARGET's
-  backbone-dim token embedding, the right half is the recurrent hidden
+- **`inputs_embeds`** = `concat(target_embed(token), hidden)` along the last dim
+  → width `2 * 2816 = 5632`, which `pre_projection` maps to 1024. Left half is
+  the TARGET's backbone-dim token embedding; right half is the recurrent hidden
   (`target_last_hidden` at step 0, the assistant's own `backbone_hidden`
   thereafter). `target_embed` is a `Gemma4TextScaledWordEmbedding` that already
   applies `sqrt(hidden_size)`, so **no extra normalizer** is added.
 - **`shared_kv_states`** = the target base model's per-layer-type shared KV,
-  obtained by calling the target base forward with
-  **`return_shared_kv_states=True`**. It is a dict:
-  `{"sliding_attention": (K, V), "full_attention": (K, V)}`.
-  Despite the target config having `num_kv_shared_layers=0`, the standard
-  `Gemma4Model` DOES populate this when the flag is passed — **no need for the
-  unified model**.
-- Assistant output: `logits` of shape `(B, T, 262144)` (full vocab) and
-  `last_hidden_state` of shape `(B, T, 2816)` (the `backbone_hidden` fed back in
-  during the multi-step TTT unroll).
+  from the target base forward with **`return_shared_kv_states=True`**. It is a
+  dict `{"sliding_attention": (K, V), "full_attention": (K, V)}`. The two layer
+  types have **different** KV shapes — full is `(B, 2, T, 512)`, sliding is
+  `(B, 8, T, 256)` — which the cache stores per-field. Despite the target config
+  having `num_kv_shared_layers=0`, the standard `Gemma4Model` populates this when
+  the flag is passed (no unified model needed).
+- Assistant output: `logits` `(B, T, 262144)` (full vocab) and
+  `last_hidden_state` `(B, T, 2816)` (the `backbone_hidden` fed back in the TTT
+  unroll).
 
 Flow (multi-step TTT, matching vLLM's autoregressive draft loop):
 
@@ -68,70 +61,103 @@ step j: token = draft_{j-1},   hidden = backbone_hidden from step j-1
     -> last_hidden_state (B,T,2816) # backbone_hidden, fed into step j+1
 ```
 
-Consequence for training: run the target base **once per sample** to produce
-`last_hidden_state` + `shared_kv_states`, then unroll K draft steps (TTT),
-feeding each step its own `backbone_hidden`, and train the assistant to match
-the target's next-token distribution at each step (soft-CE / KL, per-step
-weighted). See `gemma4_mtp/verify_parity.py` for the proof this matches
-deployment, and `gemma4_mtp/training_step.py` for the loss.
+Training runs the target base **once per sample** to produce `last_hidden` +
+`shared_kv_states`, unrolls K draft steps (TTT) feeding each its own
+`backbone_hidden`, and trains the assistant to match the target's next-token
+distribution at each step (soft-CE / KL, per-step weighted). Target soft labels
+are recomputed from `last_hidden` via the frozen tied `lm_head` — the full
+distribution, no stored logits. See `gemma4_mtp/training_step.py`.
 
 ## Data
 
-Same MAI Profile source and settings as the DSpark pipeline (see
-`DeepSpec@dev/maiprofile`): prompts under the Azure ML mount, regenerated by the
-target model, `conversations`-style JSONL. MTP fine-tuning learns the target's
-own output distribution, so training answers must be **target-regenerated**, not
-the raw human answers.
+Same MAI Profile source as the DSpark pipeline (`DeepSpec@dev/maiprofile`):
+prompts under the Azure ML mount, **regenerated by the target model**,
+`conversations`-style JSONL. MTP learns the target's own output distribution, so
+training answers must be target-regenerated, not raw human answers.
+`gemma4_mtp/build_split.py` routes the 26B regen file into train/eval by
+DSpark's existing id split.
 
-Training can run **online** (target forward every step, `--data`) or from an
-**offline cache** (`prepare_cache.py` precomputes the frozen target's per-sample
-`last_hidden` + shared KV once into a sharded on-mount store, then
-`train.py --cache-dir` runs only the small assistant). See
-`gemma4_mtp/target_cache.py`.
+## Offline target cache (the default path)
+
+The target forward is expensive and OOMs if its `(T, 262144)` logits are
+materialized every step. Since the target is frozen, its per-sample signals are
+identical every epoch, so `prepare_cache.py` computes them **once** (8-GPU
+data-parallel) and streams them to a sharded on-mount store:
+
+- **async writer**: a background thread drains a bounded queue while the GPU
+  keeps computing, so a slow mount throttles the producer instead of blocking
+  the forward or exploding memory.
+- **large binary shards + fixed-width `samples.idx` + `manifest.json`**: many
+  samples packed into a few big files (not one `.pt` per sample, which is slow
+  on network mounts). The reader (`CacheDataset`) mmaps shards with an LRU cache.
+- per sample: `input_ids`, `loss_mask`, `last_hidden`, and the `{full,sliding}`
+  shared KV (each with its own head count / head dim). No logits.
+
+`train.py --cache-dir` then runs only the small assistant — no 26B target, no
+OOM. Online mode (`--data`, target forward every step) still exists but OOMs at
+this scale; use the cache.
+
+## Freeze policy
+
+- **Frozen**: the entire target; the assistant's `lm_head` + `embed_tokens`
+  (tied to vocab — kept stock so the export stays a vLLM drop-in).
+- **Trained**: the assistant's 4 decoder layers + `pre_projection` +
+  `post_projection` (~151M params).
+
+## Run (8-GPU server)
+
+`run.sh` drives both stages (cache generation + training) with hyperparameters
+aligned to DeepSpec's `config/dspark/dspark_gemma4_12b.py` (lr=6e-4, 10 epochs,
+global batch 512, warmup 4%, weight_decay 0, grad-clip 1.0). Cache and
+checkpoints are written to the mount; the cache write is async, and checkpoints
+save only at the end by default (`SAVE_EVERY=N` for periodic saves).
+
+```bash
+bash run.sh                 # generate cache + train
+STAGE=cache bash run.sh     # only build the sharded cache
+STAGE=train bash run.sh     # only train (needs an existing cache)
+```
+
+Each launch uses a timestamped `RUN_TAG` for fresh cache/checkpoint dirs. To
+reuse one cache across separate cache/train invocations, pin it:
+
+```bash
+RUN_TAG=myrun STAGE=cache bash run.sh
+RUN_TAG=myrun STAGE=train bash run.sh
+```
+
+Override any path or hyperparameter via env, e.g. `LR=2e-4 EPOCHS=2 bash run.sh`.
+Long runs should use `tmux`/`nohup` so an RDP/SSH disconnect doesn't kill them.
+
+Then benchmark the exported checkpoint by pointing the vllm-msn MTP config's
+assistant path at it and comparing acceptance / tok-s to the stock assistant.
+
+### Quick smoke test
+
+```bash
+# generate a tiny cache (8 GPU, first 64 samples) then train a few steps
+torchrun --standalone --nproc_per_node 8 -m gemma4_mtp.prepare_cache \
+    --target /tmp/models/gemma4/text_only \
+    --data ./data/mtp_short/train_maiprofile_short_26b.jsonl \
+    --out-dir /tmp/mtp_cache_smoke --max-length 4096 --bf16 --limit 64
+
+python -m gemma4_mtp.train --cache-dir /tmp/mtp_cache_smoke \
+    --target /tmp/models/gemma4/text_only --assistant /tmp/models/gemma4/assistant \
+    --output /tmp/mtp_out_smoke --max-steps 5 --batch-size 2 --bf16 --log-every 1
+```
 
 ## Status
 
-- [x] Repo scaffold + README
-- [x] `scripts/debug_gemma_assistant.py` — interface VERIFIED on server
-- [x] `gemma4_mtp/verify_parity.py` — training-time forward proven bit-for-bit
-      identical to the official spec-decoding path (recipe + KV interaction)
-- [x] Core training step — `gemma4_mtp/training_step.py` (multi-step TTT
-      distillation; soft-CE/KL to target, per-step weighted). Local logic tests
-      green.
-- [x] Data pipeline — `gemma4_mtp/data.py` (MAI Profile conversations ->
-      input_ids/loss_mask, DSpark-compatible masking) + `target_cache.py`
-      (offline sharded cache). Local logic tests green.
-- [x] Training loop — `gemma4_mtp/train.py` (online + cache modes; freeze
-      target + assistant lm_head/embed; train the 4 decoder layers + projections;
-      AdamW + cosine; export stock-config checkpoint for vLLM). Freeze policy
-      unit-tested.
-- [ ] **Server run**: train on MAI Profile data, export, benchmark vs the stock
-      assistant on the vllm-msn scaffold (real acceptance/tok-s numbers).
-
-### Run (server)
-
-```bash
-# smoke test first: a handful of steps to confirm loss is finite + decreasing
-python -m gemma4_mtp.train \
-    --target /tmp/models/gemma4/text_only \
-    --assistant /tmp/models/gemma4/assistant \
-    --data /path/to/maiprofile_regenerated.jsonl \
-    --output ./out/mtp_smoke --bf16 --max-steps 20 --log-every 1
-
-# full run
-python -m gemma4_mtp.train \
-    --target /tmp/models/gemma4/text_only \
-    --assistant /tmp/models/gemma4/assistant \
-    --data /path/to/maiprofile_regenerated.jsonl \
-    --output ./out/mtp_maiprofile --bf16 \
-    --epochs 1 --batch-size 2 --grad-accum 8 --lr 1e-4
-```
-
-Then benchmark the exported `./out/mtp_maiprofile` by pointing the vllm-msn MTP
-config's assistant path at it and comparing to the stock assistant.
+- [x] Interface verified (`scripts/debug_gemma_assistant.py`) and forward proven
+      bit-for-bit vs the official spec-decoding path (`gemma4_mtp/verify_parity.py`)
+- [x] Multi-step TTT distillation step (`gemma4_mtp/training_step.py`)
+- [x] Data pipeline (`gemma4_mtp/data.py`) + async sharded target cache
+      (`gemma4_mtp/target_cache.py`, `prepare_cache.py`) — 8-GPU verified end to end
+- [x] 8-GPU training loop from cache (`gemma4_mtp/train.py`) + `run.sh` driver
+- [ ] **Full run + benchmark**: train on all MAI Profile data, export, measure
+      acceptance / tok-s vs the stock assistant on the vllm-msn scaffold
 
 ### Local dev note
 
-This is developed on a no-GPU machine: only syntax / structure checks locally,
-real runs happen on the 8×A100 server. All code is committed and pulled on the
-server. Scripts must fail loudly (clear errors) rather than silently.
+Developed on a no-GPU (and no-numpy) machine: only syntax / logic checks locally;
+real runs happen on the 8×A100 server, pulled via git. Scripts fail loudly.
