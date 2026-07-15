@@ -34,9 +34,11 @@ DATA="${DATA:-./data/mtp_short/train_maiprofile_short_26b.jsonl}"
 
 # Everything persistent lives on the MSN.DnI mount.
 MNT="${MNT:-$AZURE_ML_INPUT_msndni/shares/users/zxy/maiprofile}"
-DATE="${DATE:-$(date +%Y%m%d)}"
-OUT_DIR="${OUT_DIR:-$MNT/mtp_cache/$DATE/short_train}"          # sharded cache
-CKPT_DIR="${CKPT_DIR:-$MNT/checkpoints/mtp_maiprofile/$DATE}"   # checkpoints (mount)
+# Timestamped run tag so each launch gets a fresh dir (avoids colliding with a
+# previous run's leftover _tmp shards, which would trip the "not empty" guard).
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-$MNT/mtp_cache/$RUN_TAG/short_train}"        # sharded cache
+CKPT_DIR="${CKPT_DIR:-$MNT/checkpoints/mtp_maiprofile/$RUN_TAG}" # checkpoints (mount)
 
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 
@@ -65,6 +67,7 @@ echo "  NPROC       = $NPROC"
 echo "  TARGET      = $TARGET"
 echo "  ASSISTANT   = $ASSISTANT"
 echo "  DATA        = $DATA"
+echo "  RUN_TAG     = $RUN_TAG   (set RUN_TAG=... to reuse a cache across stages)"
 echo "  OUT_DIR     = $OUT_DIR   (cache, mount)"
 echo "  CKPT_DIR    = $CKPT_DIR  (checkpoints, mount)"
 echo "  hyperparams : lr=$LR epochs=$EPOCHS local_batch=$LOCAL_BATCH"
