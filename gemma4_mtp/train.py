@@ -57,6 +57,10 @@ def parse_args():
     ap.add_argument("--step-weight-beta", type=float, default=0.8,
                     help="decay for per-step loss weights (beta**k, normalized)")
     ap.add_argument("--soft-ce-weight", type=float, default=1.0)
+    ap.add_argument("--l1-weight", type=float, default=0.0,
+                    help="L1/TVD-to-target weight; accept_rate=1-0.5*L1, so this "
+                         "directly optimizes rejection-sampling acceptance "
+                         "(DSpark uses ~0.9 L1 + 0.1 CE)")
     ap.add_argument("--hard-ce-weight", type=float, default=0.0)
     ap.add_argument("--bf16", action="store_true", help="load models in bfloat16")
     ap.add_argument("--device", default="cuda")
@@ -236,6 +240,7 @@ def main():
         step_weight_beta=args.step_weight_beta,
         temperature=args.temperature,
         soft_ce_weight=args.soft_ce_weight,
+        l1_weight=args.l1_weight,
         hard_ce_weight=args.hard_ce_weight,
     )
     optim = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)

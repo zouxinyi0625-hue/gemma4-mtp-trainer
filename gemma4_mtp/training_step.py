@@ -43,6 +43,9 @@ class MTPLossConfig:
     temperature: float = 1.0
     # Distillation (soft-CE / KL to target) weight.
     soft_ce_weight: float = 1.0
+    # L1/TVD-to-target weight. accept_rate = 1 - 0.5*L1, so this directly
+    # optimizes the rejection-sampling acceptance rate (DSpark uses ~0.9).
+    l1_weight: float = 0.0
     # Hard-CE against the ground-truth next token weight.
     hard_ce_weight: float = 0.0
     ignore_index: int = -100
@@ -146,23 +149,28 @@ def _assistant_step(assistant, target_embed, normalizer, token_ids, hidden,
 
 
 def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
-    """Soft-CE (KL to target) + optional hard-CE at one aligned step.
+    """Distillation loss at one aligned draft step. Combines:
 
-    Memory-critical: the vocab is 262144, so materializing softmax over every
-    (B, L) position blows up GPU memory (the OOM at log_softmax). Only mask==1
-    positions (assistant-response tokens) are supervised, so we GATHER those
-    rows first and compute the 262144-wide softmax ONLY on them. For long
-    prompts with short responses this cuts the softmax activation by 10x+.
+      - soft-CE (KL to target)          weight cfg.soft_ce_weight
+      - L1 / TVD to target              weight cfg.l1_weight   <- accept-rate lever
+      - hard-CE to ground truth         weight cfg.hard_ce_weight
 
-    Even after gathering, a batch that happens to have many supervised tokens
-    (two long responses) makes (n_sup, 262144) too big for one softmax. So we
-    process the gathered rows in fixed-size CHUNKS and accumulate the loss —
-    numerically identical (mean = sum / n_sup), just bounded peak memory.
+    Why L1 (from DSpark deepspec/modeling/dspark/loss.py): for rejection
+    sampling the EXACT expected acceptance rate is  1 - TVD(draft, target)  =
+    1 - 0.5 * L1(draft_probs, target_probs). So minimizing L1 directly
+    maximizes the real acceptance rate — a tighter objective than KL, which
+    matches the whole distribution shape rather than the accept probability.
+    DSpark uses 0.9*L1 + 0.1*CE. We report a differentiable accept_rate metric
+    (1 - 0.5*L1) so training can be monitored against the quantity we care about.
+
+    Memory: vocab is 262144, so the (n_sup, V) softmax is chunked over rows to
+    bound peak memory (mean = sum / n_sup, numerically identical).
     """
     import torch
     import torch.nn.functional as F
 
     temp = cfg.temperature
+    l1_weight = float(getattr(cfg, "l1_weight", 0.0))
     B, L, V = draft_logits.shape
     flat_mask = mask.reshape(-1).bool()                        # (B*L,)
     n_sup = int(flat_mask.sum())
@@ -181,6 +189,7 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
     chunk = int(getattr(cfg, "loss_chunk_rows", 1024))
     soft_ce_sum = draft_logits.new_zeros(())
     hard_ce_sum = draft_logits.new_zeros(())
+    l1_sum = draft_logits.new_zeros(())
     for start in range(0, n_sup, chunk):
         d = d_flat[start:start + chunk]                        # (c, V)
         t = t_flat[start:start + chunk]                        # (c, V)
@@ -189,6 +198,13 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
         log_p = F.log_softmax(d / temp, dim=-1)
         # sum over vocab, sum over rows (divide by n_sup at the end -> mean).
         soft_ce_sum = soft_ce_sum + -(soft_t * log_p).sum(dim=-1).sum() * (temp * temp)
+        if l1_weight > 0:
+            # L1 uses UNtempered probs (the acceptance rate is defined on the
+            # actual sampling distribution, temperature 1).
+            dp = F.softmax(d, dim=-1)
+            with torch.no_grad():
+                tp = F.softmax(t, dim=-1)
+            l1_sum = l1_sum + (dp - tp).abs().sum(dim=-1).sum()
         if cfg.hard_ce_weight > 0:
             hard_ce_sum = hard_ce_sum + F.cross_entropy(
                 d, ht_flat[start:start + chunk], reduction="sum")
@@ -196,6 +212,12 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
     soft_ce = soft_ce_sum / n_sup
     total = cfg.soft_ce_weight * soft_ce
     out = {"soft_ce": soft_ce.detach()}
+    if l1_weight > 0:
+        l1 = l1_sum / n_sup
+        total = total + l1_weight * l1
+        out["l1"] = l1.detach()
+        # accept_rate = 1 - TVD = 1 - 0.5*L1  (differentiable estimate)
+        out["accept_rate"] = (1.0 - 0.5 * l1).detach()
     if cfg.hard_ce_weight > 0:
         hard_ce = hard_ce_sum / n_sup
         total = total + cfg.hard_ce_weight * hard_ce
