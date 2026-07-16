@@ -205,47 +205,40 @@ def main():
                 continue
 
             for t in range(eval_start, eval_end):
-                # --- Draft proposes k tokens from position t ---
+                # Draft k tokens anchored at position t, matching the VERIFIED
+                # training recipe (gemma4_mtp/training_step.py):
+                #   step j consumes token input_ids[t+j] with a hidden state
+                #   (target_last_hidden[t] at j=0, else the draft's own backbone
+                #   hidden from j-1) and predicts the token at position t+j+1.
+                #   The aligned target supervision is target_greedy[t+j]
+                #   (= argmax P_target(.|x_0..x_{t+j}) = the token at t+j+1).
                 draft_tokens = []
                 backbone_h = target_last_hidden[:, t:t+1, :]  # (1, 1, 2816)
 
                 for step in range(k):
-                    # Token to embed: step 0 = ground truth token at t+1
-                    # (teacher-forced context); step k>0 = draft's own prediction.
-                    if step == 0:
-                        tok = input_ids[:, t+1:t+2]  # (1, 1)
-                    else:
-                        tok = draft_tokens[-1].unsqueeze(0).unsqueeze(0)  # (1, 1)
+                    tok = input_ids[:, t+step:t+step+1]  # (1,1) input_ids[t+step]
 
-                    # Recursive recipe (vLLM gemma4_mtp.py):
-                    # inputs_embeds = embed(tok) * sqrt(backbone_dim)
-                    # combined = cat(inputs_embeds, hidden_states)
-                    tok_embed = target_embed(tok)  # (1,1,2816) NO normalizer (embed_scale built in)
-                    combined = torch.cat([tok_embed, backbone_h], dim=-1)  # (1, 1, 5632)
+                    # inputs_embeds = concat(target_embed(tok), hidden). No extra
+                    # normalizer: Gemma4TextScaledWordEmbedding already scales.
+                    tok_embed = target_embed(tok)                      # (1,1,2816)
+                    combined = torch.cat([tok_embed, backbone_h], dim=-1)  # (1,1,5632)
 
-                    # Run the assistant forward
                     asst_out = assistant(
                         inputs_embeds=combined,
                         shared_kv_states=shared_kv_states,
                         position_ids=None,
                         attention_mask=None,
                     )
-                    # assistant returns logits + last_hidden_state
-                    draft_logits = asst_out.logits  # (1, 1, V)
-                    # last_hidden_state = post_projection output = backbone_hidden
-                    backbone_h = asst_out.last_hidden_state  # (1, 1, 2816)
+                    draft_logits = asst_out.logits               # (1, 1, V)
+                    backbone_h = asst_out.last_hidden_state       # (1, 1, 2816)
+                    draft_tokens.append(draft_logits.argmax(dim=-1).squeeze())
 
-                    draft_token = draft_logits.argmax(dim=-1).squeeze()  # scalar
-                    draft_tokens.append(draft_token)
-
-                # --- Target verifies the k draft tokens ---
+                # Verify: draft step `pos` predicts token t+pos+1; the aligned
+                # target greedy is target_greedy[t+pos].
                 total_drafts += 1
                 for pos in range(k):
                     total_draft_tokens += 1
                     per_pos_total[pos] += 1
-                    # Draft predicted token at position t+1+pos
-                    # Target's greedy at position t+pos is target_greedy[:, t+pos]
-                    # (which predicts token at t+pos+1)
                     expected = target_greedy[0, t + pos].item()
                     predicted = draft_tokens[pos].item()
                     if predicted == expected:
