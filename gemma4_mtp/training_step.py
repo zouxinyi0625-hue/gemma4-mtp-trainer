@@ -232,6 +232,7 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
     # Recurrent hidden fed to the draft; starts as the target's last hidden.
     hidden = target_last_hidden                        # (B, T, H) indexed by t
+    prev_draft_logits = None      # step k-1's draft logits, for the fed-back token
 
     for k in range(K):
         # At step k, position t consumes token[t+k] and predicts token[t+k+1].
@@ -239,14 +240,23 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
         L = T - k - 1
         if L <= 0:
             break
-        # Token consumed this step: input_ids[:, k : k+L]  (position t -> t+k).
-        token_ids_k = input_ids[:, k:k + L]                       # (B, L)
+        if k == 0:
+            # Step 0 consumes the real next token (stand-in for the target's
+            # sampled token that vLLM feeds at step 0).
+            token_ids_k = input_ids[:, 0:L]                       # (B, L)
+        else:
+            # Steps k>0 consume the DRAFT's OWN previous prediction (vLLM
+            # llm_base_proposer.py:574), not ground truth. prev argmax at
+            # position j aligns with what position j consumes now; detach so the
+            # token branch is straight-through (recurrent hidden keeps grad).
+            token_ids_k = prev_draft_logits[:, :L, :].argmax(dim=-1).detach()
         hidden_k = hidden[:, :L, :]                               # (B, L, H)
 
         draft_logits, backbone_hidden = _assistant_step(
             assistant, target_embed, normalizer,
             token_ids_k, hidden_k, shared_kv_states, None,
         )                                                        # (B, L, V), (B, L, H)
+        prev_draft_logits = draft_logits
 
         # Supervision: draft_logits[:, t] should predict token[t+k+1] with the
         # target's distribution at position t+k.
@@ -298,16 +308,29 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     total_loss = torch.zeros((), device=input_ids.device)
     metrics: dict[str, object] = {}
     hidden = last_hidden
+    prev_draft_logits = None      # step k-1's draft logits, for the fed-back token
 
     for k in range(K):
         L = T - k - 1
         if L <= 0:
             break
-        token_ids_k = input_ids[:, k:k + L]
+        if k == 0:
+            # Step 0 consumes the real next token (vLLM step0 consumes the
+            # target's freshly sampled token; ground-truth is its stand-in).
+            token_ids_k = input_ids[:, 0:L]
+        else:
+            # Steps k>0 consume the DRAFT's OWN previous prediction, matching
+            # vLLM inference (llm_base_proposer.py:574) — not ground truth.
+            # Position j at step k-1 predicts the token position j consumes at
+            # step k, so prev argmax sliced to this step's shorter window aligns
+            # exactly. Detached: token branch is straight-through (no grad), the
+            # recurrent hidden branch below still carries gradient.
+            token_ids_k = prev_draft_logits[:, :L, :].argmax(dim=-1).detach()
         hidden_k = hidden[:, :L, :]
         draft_logits, backbone_hidden = _assistant_step(
             assistant, target_embed, None, token_ids_k, hidden_k,
             shared_kv_states, None)
+        prev_draft_logits = draft_logits
         hard_targets_k = input_ids[:, k + 1:k + 1 + L]
         mask_k = loss_mask[:, k + 1:k + 1 + L]
 
