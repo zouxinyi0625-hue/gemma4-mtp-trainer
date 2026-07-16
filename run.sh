@@ -77,10 +77,14 @@ echo "  STAGE       = $STAGE"
 echo ""
 
 # ---- preflight ------------------------------------------------------------
-if [[ ! -f "$DATA" ]]; then
-  echo "!! DATA not found: $DATA"
-  echo "   Generate it first with gemma4_mtp.build_split (see its docstring)."
-  exit 1
+# DATA (the raw jsonl) is only needed to BUILD the cache. STAGE=train reads the
+# already-built cache, so don't require DATA there.
+if [[ "$STAGE" == "all" || "$STAGE" == "cache" ]]; then
+  if [[ ! -f "$DATA" ]]; then
+    echo "!! DATA not found: $DATA"
+    echo "   Generate it first with gemma4_mtp.build_split (see its docstring)."
+    exit 1
+  fi
 fi
 
 # ---- stage 1: prepare cache ----------------------------------------------
