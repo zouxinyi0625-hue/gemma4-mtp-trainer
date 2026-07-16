@@ -53,6 +53,12 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"      # dspark warmup_ratio
 TTT_STEPS="${TTT_STEPS:-5}"
 SAVE_EVERY="${SAVE_EVERY:-0}"             # 0 = save only at end (avoid frequent mount writes)
 LOG_EVERY="${LOG_EVERY:-10}"
+# Loss weights. Default = pure soft-CE (KL). Set L1_WEIGHT>0 for the DSpark
+# acceptance-rate objective (accept_rate = 1 - 0.5*L1); dspark uses
+# SOFT_CE=0 L1_WEIGHT=0.9 HARD_CE=0.1.
+SOFT_CE="${SOFT_CE:-1.0}"
+L1_WEIGHT="${L1_WEIGHT:-0.0}"
+HARD_CE="${HARD_CE:-0.0}"
 
 # grad_accum so that local_batch * nproc * grad_accum == global_batch.
 GRAD_ACCUM=$(( GLOBAL_BATCH / (LOCAL_BATCH * NPROC) ))
@@ -72,6 +78,7 @@ echo "  OUT_DIR     = $OUT_DIR   (cache, mount)"
 echo "  CKPT_DIR    = $CKPT_DIR  (checkpoints, mount)"
 echo "  hyperparams : lr=$LR epochs=$EPOCHS local_batch=$LOCAL_BATCH"
 echo "                global_batch=$GLOBAL_BATCH -> grad_accum=$GRAD_ACCUM"
+echo "                loss: soft_ce=$SOFT_CE l1=$L1_WEIGHT hard_ce=$HARD_CE"
 echo "                ttt_steps=$TTT_STEPS save_every=$SAVE_EVERY"
 echo "  STAGE       = $STAGE"
 echo ""
@@ -147,6 +154,9 @@ print(max(1, round(total * $WARMUP_RATIO)))
       --weight-decay "$WEIGHT_DECAY" \
       --warmup-steps "$WARMUP_STEPS" \
       --ttt-steps "$TTT_STEPS" \
+      --soft-ce-weight "$SOFT_CE" \
+      --l1-weight "$L1_WEIGHT" \
+      --hard-ce-weight "$HARD_CE" \
       --max-length "$MAX_LENGTH" \
       $SAVE_ARG \
       --bf16 --log-every "$LOG_EVERY" 2>&1 | filter
