@@ -86,3 +86,85 @@ if backbone and abs(hf_scale - vllm_scale) < 1e-3:
     print("  VERDICT #1: scales MATCH. OK.")
 else:
     print("  VERDICT #1: scales DIFFER -> token half off by this ratio -> BUG.")
+
+print()
+print("=" * 60)
+print("#6  lm_head / embed_tokens TIE and dims (prime new suspect)")
+print("=" * 60)
+print("tie_word_embeddings:", getattr(acfg, "tie_word_embeddings",
+                                      getattr(tc, "tie_word_embeddings", "?")))
+# actual shape of the checkpoint's embed_tokens (which lm_head is tied to)
+emb_shape = None
+if files:
+    for f in files:
+        with safe_open(f, framework="pt") as sf:
+            if "model.embed_tokens.weight" in sf.keys():
+                emb_shape = sf.get_slice("model.embed_tokens.weight").get_shape()
+                break
+print("checkpoint model.embed_tokens.weight shape:", emb_shape)
+print("draft hidden_size (vLLM lm_head expects vocab x this):", draft_hidden)
+print()
+print("vLLM: draft lm_head is (vocab, draft_hidden). When tie_word_embeddings=True,")
+print("      lm_head.weight = draft embed_tokens.weight, which in vLLM is (vocab, draft_hidden).")
+print("      vLLM computes draft_logits = lm_head(norm_hidden) where norm_hidden is DRAFT-dim.")
+if emb_shape is not None and draft_hidden is not None:
+    if emb_shape[1] == draft_hidden:
+        print(f"  VERDICT #6: embed_tokens is (vocab, {emb_shape[1]}) == draft_hidden. OK — "
+              "tied lm_head is draft-dim as vLLM expects.")
+    elif emb_shape[1] == te.embedding_dim:
+        print(f"  VERDICT #6: BUG — checkpoint embed_tokens is (vocab, {emb_shape[1]}) = "
+              f"BACKBONE dim ({te.embedding_dim}), NOT draft_hidden ({draft_hidden}). "
+              "The training OVERWROTE the draft embed with the target backbone embed and saved it. "
+              "vLLM ties its draft-dim lm_head expecting draft_hidden -> dim conflict / garbage logits -> 3%.")
+    else:
+        print(f"  VERDICT #6: embed_tokens dim {emb_shape[1]} matches neither "
+              f"draft {draft_hidden} nor backbone {te.embedding_dim} — inspect.")
+
+print()
+print("=" * 60)
+print("#7  DIFF your checkpoint keys vs the STOCK assistant (the 76% model)")
+print("=" * 60)
+STOCK = os.environ.get("STOCK_ASSISTANT", "/tmp/models/gemma4/assistant")
+print(f"stock assistant dir: {STOCK}")
+stock_files = sorted(glob.glob(os.path.join(STOCK, "*.safetensors")))
+stock_keys = set()
+stock_shapes = {}
+if stock_files:
+    for f in stock_files:
+        with safe_open(f, framework="pt") as sf:
+            for k in sf.keys():
+                stock_keys.add(k)
+                stock_shapes[k] = tuple(sf.get_slice(k).get_shape())
+else:
+    print("  (no safetensors in stock dir; skipping diff)")
+
+your_keys = set(keys)
+if stock_keys:
+    only_stock = sorted(stock_keys - your_keys)
+    only_yours = sorted(your_keys - stock_keys)
+    print(f"stock keys: {len(stock_keys)}   your keys: {len(your_keys)}")
+    print("keys in STOCK but MISSING from yours (vLLM may expect these!):")
+    for k in only_stock:
+        print("   -", k, stock_shapes.get(k))
+    print("keys in YOURS but not in stock:")
+    for k in only_yours:
+        print("   +", k)
+    # shape mismatches on shared keys
+    shared = your_keys & stock_keys
+    your_shapes = {}
+    for f in files:
+        with safe_open(f, framework="pt") as sf:
+            for k in sf.keys():
+                your_shapes[k] = tuple(sf.get_slice(k).get_shape())
+    mism = [(k, stock_shapes[k], your_shapes.get(k))
+            for k in sorted(shared) if stock_shapes[k] != your_shapes.get(k)]
+    print("shape mismatches on shared keys:")
+    for k, s, y in mism:
+        print(f"   ! {k}: stock={s} yours={y}")
+    if not only_stock and not only_yours and not mism:
+        print("  VERDICT #7: checkpoint structure IDENTICAL to stock. Export is fine;")
+        print("             the degradation is from the TRAINED VALUES, not the format.")
+    else:
+        print("  VERDICT #7: STRUCTURE DIFFERS from the 76% stock model -> likely the bug.")
+
+
