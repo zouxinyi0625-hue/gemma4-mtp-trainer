@@ -127,7 +127,12 @@ def main():
     # --- Distributed setup (torchrun sets RANK/LOCAL_RANK/WORLD_SIZE) ---
     ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
     if ddp:
-        dist.init_process_group(backend="nccl")
+        # Large timeout so a rank0 checkpoint write to a slow mount (the only
+        # long single-rank op; other ranks wait at a barrier) doesn't trip the
+        # NCCL watchdog. Default 600s is too short for save_pretrained to a mount.
+        import datetime
+        dist.init_process_group(
+            backend="nccl", timeout=datetime.timedelta(hours=2))
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -287,23 +292,37 @@ def main():
                     lr = sched.get_last_lr()[0]
                     msg = " ".join(f"{k}={float(v):.4f}" for k, v in metrics.items())
                     log(f"epoch {epoch} step {step}/{total_steps} lr={lr:.2e} {msg}")
-                if is_main and args.save_every and step % args.save_every == 0:
-                    _save(assistant_module, tokenizer,
-                          os.path.join(args.output, f"step{step}"))
+                if args.save_every and step % args.save_every == 0:
+                    # All ranks sync first, then rank0 saves alone while the
+                    # others wait at the next barrier — keeps rank0's slow-mount
+                    # write off the DDP all_reduce path (else it can time out).
+                    if ddp:
+                        dist.barrier()
+                    if is_main:
+                        _save(assistant_module, tokenizer,
+                              os.path.join(args.output, f"step{step}"))
+                    if ddp:
+                        dist.barrier()
                 if args.max_steps and step >= args.max_steps:
                     log("[stop] reached --max-steps")
+                    # Barrier BEFORE the save: sync while ranks are in step
+                    # (cheap), then rank0 saves alone. A barrier AFTER the save
+                    # would make non-main ranks wait on rank0's slow-mount
+                    # save_pretrained and blow past the NCCL watchdog timeout.
+                    if ddp:
+                        dist.barrier()
                     if is_main:
                         _save(assistant_module, tokenizer, args.output)
                     if ddp:
-                        dist.barrier()
                         dist.destroy_process_group()
                     return
 
-    if is_main:
-        _save(assistant_module, tokenizer, args.output)
     log("=== Done ===")
     if ddp:
         dist.barrier()
+    if is_main:
+        _save(assistant_module, tokenizer, args.output)
+    if ddp:
         dist.destroy_process_group()
 
 
