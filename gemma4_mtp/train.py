@@ -300,6 +300,7 @@ def main():
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                 p.grad /= world
 
+    printed_baseline = False
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -333,6 +334,14 @@ def main():
                 else:
                     loss, metrics = run_step(batch)
                     (loss / args.grad_accum).backward()
+
+            # step-0 baseline: metrics from the FIRST batch reflect the loaded
+            # (un-updated) model — this is the stock assistant's accept before
+            # any training. Print it once so we can compare against later steps.
+            if not printed_baseline:
+                printed_baseline = True
+                msg = " ".join(f"{k}={float(v):.4f}" for k, v in metrics.items())
+                log(f"[baseline] step 0 (before any update) {msg}")
 
             if (i + 1) % args.grad_accum == 0:
                 if use_cache:

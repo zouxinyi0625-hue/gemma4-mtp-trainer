@@ -52,7 +52,7 @@ WARMUP_STEPS="${WARMUP_STEPS:-}"          # if empty, computed as 4% of total st
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"      # dspark warmup_ratio
 TTT_STEPS="${TTT_STEPS:-5}"
 SAVE_EVERY="${SAVE_EVERY:-0}"             # 0 = save only at end (avoid frequent mount writes)
-LOG_EVERY="${LOG_EVERY:-10}"
+LOG_EVERY="${LOG_EVERY:-1}"
 # Loss weights. Default = argmax-CE (the differentiable proxy for vLLM's GREEDY
 # accept: draft_argmax == target_argmax). Single-anchor training with
 # NUM_ANCHORS answer-position anchors per sequence.
