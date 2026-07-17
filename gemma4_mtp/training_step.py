@@ -430,7 +430,7 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
 
 def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
-                             cfg: MTPLossConfig):
+                             cfg: MTPLossConfig, backward_fn=None):
     """Single-anchor TTT training from PRECOMPUTED target signals (no 26B).
 
     Matches vLLM inference (SinglePositionMultiTokenCandidateGenerator):
@@ -441,13 +441,25 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     so they are naturally isolated — draft tokens never attend each other,
     exactly like vLLM's per-request drafts.
 
-    Loss is GLOBALLY normalized: we accumulate a weighted numerator (SUM over
-    all supervised rows, weighted by exp(-k/gamma) per step) and a weighted
-    denominator (SUM of weights over rows), all-reduce the denominator across
-    ranks, and divide once — then multiply by world_size so DDP's gradient
-    averaging reproduces the true global-mean gradient (DSpark loss.py:237,252).
-    The previous per-chunk/per-rank normalization gave each rank a different
-    loss scale and diverged.
+    TWO-PASS global normalization (avoids OOM):
+      Pass 1 — NO forward, NO graph: the number of supervised rows per step
+        depends only on anchor positions + loss_mask (not on draft outputs), so
+        we compute the weighted denominator by pure indexing, then all-reduce it
+        across ranks. Zero extra memory.
+      Pass 2 — with grad: run the draft forward per anchor chunk, compute each
+        chunk's loss, and back-propagate it IMMEDIATELY (via backward_fn) divided
+        by the global denominator × world_size. Each chunk's graph frees before
+        the next, so peak activation memory is one chunk — decoupled from
+        num_anchors. Global denominator + ×world_size makes DDP's gradient
+        averaging equal the true global-mean gradient (DSpark loss.py:237,252).
+        Accumulating the whole-step graph instead (single backward) OOMs at
+        num_anchors=128 (80 forwards' activations resident at once).
+
+    backward_fn(loss_chunk): called once per chunk with the already-normalized,
+    graph-attached chunk loss; must run .backward(). The caller must NOT call
+    .backward() on the returned (detached) loss. If None (tests / online path),
+    falls back to accumulating one graph and returning it — only safe for small
+    num_anchors.
 
     batch: input_ids (B,T), loss_mask (B,T), last_hidden (B,T,H),
            shared_kv_states dict of (K,V) each (B, Hkv, T, D).
@@ -478,28 +490,42 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     ddp = dist.is_available() and dist.is_initialized()
     world_size = dist.get_world_size() if ddp else 1
 
+    # ---- PASS 1: global denominator, NO forward, NO graph -----------------
+    # step_valid at step k depends only on (anchor+k < T) and loss_mask, not on
+    # any draft output, so we can compute the weighted denominator by indexing.
+    den_local = torch.zeros((), device=device)
+    per_step_rows = [0] * K
+    with torch.no_grad():
+        for k in range(K):
+            tgt_idx = (flat_anchor + k).clamp(max=T - 1)
+            step_valid = flat_keep & ((flat_anchor + k) < T) & \
+                (loss_mask[batch_idx, tgt_idx] > 0)
+            nk = int(step_valid.sum())
+            per_step_rows[k] = nk
+            den_local = den_local + weights[k] * nk
+    den_global = den_local.clone()
+    if ddp:
+        dist.all_reduce(den_global, op=dist.ReduceOp.SUM)
+    den_global = den_global.clamp_min(1.0)
+    # scale each chunk's loss by this so summed chunk grads = global-mean grad,
+    # and ×world_size cancels DDP's averaging.
+    norm = float(world_size) / float(den_global)
+
     if int(flat_keep.sum()) == 0:
-        # No supervised anchors on THIS rank. Still take a (zero) grad path and
-        # contribute 0 to the all-reduced denominator so other ranks proceed.
-        z = last_hidden.sum() * 0.0
-        den = torch.zeros((), device=device)
-        if ddp:
-            dist.all_reduce(den, op=dist.ReduceOp.SUM)
+        # No supervised anchors on THIS rank, but DDP still needs a matching
+        # backward. Emit a zero loss touching the trainable graph.
+        z = last_hidden.sum() * 0.0 + input_ids.new_zeros(()).float() * 0.0
+        if backward_fn is not None:
+            # nothing to backward; other ranks' all_reduce already matched above
+            return torch.zeros((), device=device), {"loss": 0.0}
         return z, {"loss": z.detach()}
 
-    # 2. anchors on the BATCH dim: broadcast the full-seq KV to a chunk of rows
-    #    and use a per-anchor 2D mask (1=attend up to anchor, 0=block future) so
-    #    the draft can't see the answer. position_ids fixed at the anchor and KV
-    #    doesn't grow across TTT steps (draft writes no KV), matching vLLM's
-    #    single-anchor semantics. Anchors are processed in chunks of anchor_chunk
-    #    so peak attention memory (repeat_kv over full T) scales with chunk_size,
-    #    not num_anchors.
+    # ---- PASS 2: forward + per-chunk backward -----------------------------
     kv_pos = torch.arange(T, device=device).unsqueeze(0)     # (1, T) for masks
     chunk_size = int(getattr(cfg, "anchor_chunk", 0)) or 8
 
-    total_num = torch.zeros((), device=device)               # graph-attached numerator
-    den_local = torch.zeros((), device=device)               # weighted row count
-    # per-step metric accumulators (sums; divided by per-step row counts at end)
+    total_loss_log = 0.0                                     # scalar, for logging
+    accum_num = None                                        # fallback (no backward_fn)
     step_acc = {k: {"num": 0.0, "argmax_ce": 0.0, "accept": 0.0,
                     "soft_ce": 0.0, "l1": 0.0} for k in range(K)}
 
@@ -521,6 +547,7 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
         hid = last_hidden[c_batch, c_anchor].unsqueeze(1)     # (nc, 1, H)
         pos = c_anchor.unsqueeze(1)                           # (nc, 1) FIXED
 
+        chunk_num = torch.zeros((), device=device)           # graph-attached, THIS chunk
         for k in range(K):
             draft_logits, backbone_hidden = _assistant_step(
                 assistant, target_embed, None, tok_k, hid,
@@ -544,9 +571,7 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             # loss_num is a graph-attached SUM over the nvalid rows (NOT a mean).
             loss_num, n, sm = _anchor_loss(d_rows, th_rows, target_lm_head,
                                            ht_rows, cfg)
-            w = weights[k]
-            total_num = total_num + w * loss_num             # weighted numerator
-            den_local = den_local + w * n                    # weighted denominator
+            chunk_num = chunk_num + weights[k] * loss_num
             a = step_acc[k]
             a["num"] += n
             a["accept"] += float(sm["greedy_hit_sum"])
@@ -554,14 +579,15 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             a["soft_ce"] += float(sm["soft_ce_sum"])
             a["l1"] += float(sm["l1_sum"])
 
-    # Global denominator across ranks so every rank uses the same loss scale.
-    den_global = den_local.detach().clone()
-    if ddp:
-        dist.all_reduce(den_global, op=dist.ReduceOp.SUM)
-    den_global = den_global.clamp_min(1.0)
-    # x world_size: DDP averages grads across ranks, which divides by world_size;
-    # multiplying here cancels that so the result is the true global-mean grad.
-    loss = total_num / den_global * float(world_size)
+        # Normalize by the GLOBAL denominator, then back-propagate THIS chunk and
+        # free its graph before the next one.
+        if isinstance(chunk_num, torch.Tensor) and chunk_num.requires_grad:
+            chunk_loss = chunk_num * norm
+            total_loss_log += float(chunk_loss.detach())
+            if backward_fn is not None:
+                backward_fn(chunk_loss)
+            else:
+                accum_num = chunk_loss if accum_num is None else accum_num + chunk_loss
 
     for k in range(K):
         a = step_acc[k]
@@ -575,5 +601,12 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
         if cfg.l1_weight > 0:
             metrics[f"step{k}_l1"] = a["l1"] / a["num"]
 
-    metrics["loss"] = loss.detach()
-    return loss, metrics
+    metrics["loss"] = total_loss_log
+    if backward_fn is not None:
+        # grads already accumulated per chunk; return a detached scalar so the
+        # caller does NOT call .backward() again.
+        return torch.zeros((), device=device), metrics
+    # Fallback (no backward_fn): return the accumulated graph loss to backward.
+    if accum_num is None:
+        accum_num = last_hidden.sum() * 0.0
+    return accum_num, metrics

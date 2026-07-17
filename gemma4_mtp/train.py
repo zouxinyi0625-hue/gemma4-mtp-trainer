@@ -295,6 +295,20 @@ def main():
                 assistant_module, target_embed, target_lm_head, batch, loss_cfg)
         return training_step(target, assistant_module, batch, loss_cfg)
 
+    def manual_grad_sync():
+        """All-reduce trainable grads (cache path back-propagates each anchor
+        chunk separately under no_sync, so DDP's backward hooks can't sync).
+        Every rank must all_reduce the SAME set of params in the SAME order or
+        NCCL deadlocks, so we materialize a zero grad for any param that got
+        none on this rank before reducing."""
+        if not ddp:
+            return
+        for p in trainable:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad /= float(world_size)
+
     printed_baseline = False
     for epoch in range(args.epochs):
         if sampler is not None:
@@ -303,17 +317,34 @@ def main():
             batch = to_device(batch)
             is_accum_step = (i + 1) % args.grad_accum != 0
 
-            # Standard DDP path for both cache and online training. The cache
-            # loss is already globally normalized and x world_size, so DDP's
-            # gradient averaging yields the true global-mean gradient. DDP syncs
-            # grads on the backward of the LAST micro-step only.
-            if ddp and is_accum_step:
-                with assistant.no_sync():
+            if use_cache:
+                # Two-pass cache step: it back-propagates each anchor chunk
+                # itself (freeing each chunk's graph — avoids the 80-forward OOM)
+                # via backward_fn. The loss is already globally normalized and
+                # x world_size, so summing chunk grads then averaging across
+                # ranks (manual_grad_sync) yields the global-mean gradient. All
+                # chunk backwards run under no_sync; we all-reduce once at the
+                # accum boundary. grad_accum folded into backward_fn.
+                def bwd(chunk_loss):
+                    (chunk_loss / args.grad_accum).backward()
+                if ddp:
+                    with assistant.no_sync():
+                        _, metrics = training_step_from_cache(
+                            assistant_module, target_embed, target_lm_head,
+                            batch, loss_cfg, backward_fn=bwd)
+                else:
+                    _, metrics = training_step_from_cache(
+                        assistant_module, target_embed, target_lm_head,
+                        batch, loss_cfg, backward_fn=bwd)
+            else:
+                # DDP syncs grads on the backward of the LAST micro-step only.
+                if ddp and is_accum_step:
+                    with assistant.no_sync():
+                        loss, metrics = run_step(batch)
+                        (loss / args.grad_accum).backward()
+                else:
                     loss, metrics = run_step(batch)
                     (loss / args.grad_accum).backward()
-            else:
-                loss, metrics = run_step(batch)
-                (loss / args.grad_accum).backward()
 
             # step-0 baseline: metrics from the FIRST batch reflect the loaded
             # (un-updated) model — this is the stock assistant's accept before
@@ -324,6 +355,8 @@ def main():
                 log(f"[baseline] step 0 (before any update) {msg}")
 
             if (i + 1) % args.grad_accum == 0:
+                if use_cache:
+                    manual_grad_sync()
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 optim.step()
                 sched.step()
