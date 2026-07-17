@@ -65,15 +65,25 @@ class MTPLossConfig:
     # with num_anchors), so this decouples memory from num_anchors. Lower it if
     # you still OOM; raise it for throughput.
     anchor_chunk: int = 8
+    # Per-position loss decay: draft step k is weighted exp(-k / gamma), so tail
+    # steps (which are inherently harder / lower-accept) don't dominate the loss.
+    # Matches DSpark's loss_decay_gamma. <=0 disables (all steps equal weight).
+    loss_decay_gamma: float = 4.0
 
 
 def compute_step_weights(cfg: MTPLossConfig) -> list[float]:
     if cfg.step_weights is not None:
         assert len(cfg.step_weights) == cfg.ttt_steps
         return list(cfg.step_weights)
-    w = [cfg.step_weight_beta ** k for k in range(cfg.ttt_steps)]
-    s = sum(w)
-    return [x / s for x in w]
+    import math
+    gamma = float(getattr(cfg, "loss_decay_gamma", 0.0))
+    if gamma and gamma > 0:
+        # DSpark-style exponential decay: exp(-k/gamma). NOT normalized to sum 1
+        # — the loss is globally normalized by a weighted denominator later, so
+        # only the RELATIVE per-step weights matter here.
+        return [math.exp(-k / gamma) for k in range(cfg.ttt_steps)]
+    # gamma disabled: equal weight per step.
+    return [1.0 for _ in range(cfg.ttt_steps)]
 
 
 def locate_target_parts(target):
@@ -240,21 +250,40 @@ def _step_loss(draft_logits, target_hidden, target_lm_head, hard_targets, mask, 
     th_flat = target_hidden.reshape(-1, H)[flat_mask]          # (n_sup, H)
     if cfg.hard_ce_weight > 0:
         ht_flat = hard_targets.reshape(-1)[flat_mask]
-    return _anchor_loss(d_flat, th_flat, target_lm_head,
-                        ht_flat if cfg.hard_ce_weight > 0 else None, cfg)
+    # _anchor_loss now returns (loss_num_sum, N, metric_sums) un-normalized.
+    # The online path is single-step and not the DDP-critical route, so just
+    # normalize locally to a mean here to preserve its old (loss, metrics) API.
+    loss_num_sum, n, msum = _anchor_loss(
+        d_flat, th_flat, target_lm_head,
+        ht_flat if cfg.hard_ce_weight > 0 else None, cfg)
+    if n == 0:
+        z = draft_logits.sum() * 0.0
+        return z, {"soft_ce": z.detach()}
+    metrics = {"greedy_accept": (msum["greedy_hit_sum"] / n).detach()}
+    if cfg.argmax_ce_weight > 0:
+        metrics["argmax_ce"] = (msum["argmax_ce_sum"] / n).detach()
+    if cfg.soft_ce_weight > 0:
+        metrics["soft_ce"] = (msum["soft_ce_sum"] / n).detach()
+    if cfg.l1_weight > 0:
+        metrics["l1"] = (msum["l1_sum"] / n).detach()
+    return loss_num_sum / n, metrics
 
 
 def _anchor_loss(d_flat, th_flat, target_lm_head, ht_flat, cfg):
     """Loss over N gathered draft rows (N, V) vs target hidden (N, H).
 
-    MAIN objective: argmax-CE — cross-entropy of draft logits against the
-    target's argmax token (top-1). This is the differentiable proxy for vLLM's
-    greedy accept (accepted <=> draft_argmax == target_argmax). Optional
-    soft-CE (KL), L1/TVD, and hard-CE-to-ground-truth are added by weight.
+    Returns (loss_num_sum, N, metric_sums) — UN-normalized. The caller
+    accumulates loss_num_sum (a graph-attached SUM over rows, weighted by the
+    configured loss terms) and N (row count) across chunks/anchors, then divides
+    once by a GLOBAL denominator (all-reduced across ranks) so the DDP-averaged
+    gradient equals the global-mean gradient (DSpark loss.py:237,252). Dividing
+    per-chunk / per-rank (the old behavior) gave each rank a different loss scale
+    and biased the gradient → training diverged.
 
-    Reports greedy_accept = mean(draft_argmax == target_argmax) — the exact
-    (non-differentiable) quantity vLLM's bench measures, for monitoring.
-    Target logits computed per-chunk (never full N x 262144 at once).
+    MAIN objective: argmax-CE — cross-entropy of draft logits against the
+    target's argmax token (top-1); the differentiable proxy for vLLM's greedy
+    accept. metric_sums carries per-term SUMS (not means) plus greedy_hit_sum so
+    the caller can report weighted means.
     """
     import torch
     import torch.nn.functional as F
@@ -265,7 +294,7 @@ def _anchor_loss(d_flat, th_flat, target_lm_head, ht_flat, cfg):
     N = d_flat.shape[0]
     if N == 0:
         z = d_flat.sum() * 0.0
-        return z, {"argmax_ce": z.detach()}
+        return z, 0, {"greedy_hit_sum": z.detach()}
 
     chunk = int(getattr(cfg, "loss_chunk_rows", 1024))
     soft_ce_sum = d_flat.new_zeros(())
@@ -301,26 +330,24 @@ def _anchor_loss(d_flat, th_flat, target_lm_head, ht_flat, cfg):
             hard_ce_sum = hard_ce_sum + F.cross_entropy(
                 d, ht_flat[s:s + chunk], reduction="sum")
 
-    total = d_flat.new_zeros(())
-    out = {"greedy_accept": (greedy_hit_sum / N).detach()}
+    # Weighted SUM of loss terms (still summed over rows, NOT divided by N).
+    loss_num_sum = d_flat.new_zeros(())
     if argmax_w > 0:
-        argmax_ce = argmax_ce_sum / N
-        total = total + argmax_w * argmax_ce
-        out["argmax_ce"] = argmax_ce.detach()
+        loss_num_sum = loss_num_sum + argmax_w * argmax_ce_sum
     if cfg.soft_ce_weight > 0:
-        soft_ce = soft_ce_sum / N
-        total = total + cfg.soft_ce_weight * soft_ce
-        out["soft_ce"] = soft_ce.detach()
+        loss_num_sum = loss_num_sum + cfg.soft_ce_weight * soft_ce_sum
     if l1_weight > 0:
-        l1 = l1_sum / N
-        total = total + l1_weight * l1
-        out["l1"] = l1.detach()
-        out["accept_rate"] = (1.0 - 0.5 * l1).detach()
+        loss_num_sum = loss_num_sum + l1_weight * l1_sum
     if cfg.hard_ce_weight > 0 and ht_flat is not None:
-        hard_ce = hard_ce_sum / N
-        total = total + cfg.hard_ce_weight * hard_ce
-        out["hard_ce"] = hard_ce.detach()
-    return total, out
+        loss_num_sum = loss_num_sum + cfg.hard_ce_weight * hard_ce_sum
+
+    metric_sums = {
+        "greedy_hit_sum": greedy_hit_sum.detach(),
+        "argmax_ce_sum": argmax_ce_sum.detach(),
+        "soft_ce_sum": soft_ce_sum.detach(),
+        "l1_sum": l1_sum.detach(),
+    }
+    return loss_num_sum, N, metric_sums
 
 
 def training_step(target, assistant, batch, cfg: MTPLossConfig):
@@ -403,31 +430,30 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
 
 def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
-                             cfg: MTPLossConfig, backward_fn=None):
+                             cfg: MTPLossConfig):
     """Single-anchor TTT training from PRECOMPUTED target signals (no 26B).
 
     Matches vLLM inference (SinglePositionMultiTokenCandidateGenerator):
     sample answer-position anchors, and for each anchor run k autoregressive
-    draft steps at a FIXED position, attending only the target KV. Anchors are
-    laid out on the BATCH dim (N = B*A rows, seq_len 1 each) so they are
-    naturally isolated — they never attend each other, exactly like vLLM's
-    per-request drafts. Compute/memory scale with num_anchors, NOT seq_len.
+    draft steps at a FIXED position (position_ids never advance — vLLM
+    constant_draft_positions=True), attending only the target KV up to the
+    anchor. Anchors are laid out on the BATCH dim (N = B*A rows, seq_len 1 each)
+    so they are naturally isolated — draft tokens never attend each other,
+    exactly like vLLM's per-request drafts.
 
-    Objective: argmax-CE (draft logits vs target argmax) — the differentiable
-    proxy for vLLM's greedy accept rule. See _anchor_loss.
-
-    backward_fn: if given, called as backward_fn(chunk_loss) right after each
-    anchor chunk so that chunk's autograd graph is freed BEFORE the next chunk
-    runs. This keeps peak activation memory at one chunk, not all N//chunk
-    chunks at once (the whole point of chunking). The caller must NOT call
-    .backward() on the returned loss in that case — grads are already
-    accumulated. When None, returns a graph-attached loss for the caller to
-    back-propagate (used by tests / the online path).
+    Loss is GLOBALLY normalized: we accumulate a weighted numerator (SUM over
+    all supervised rows, weighted by exp(-k/gamma) per step) and a weighted
+    denominator (SUM of weights over rows), all-reduce the denominator across
+    ranks, and divide once — then multiply by world_size so DDP's gradient
+    averaging reproduces the true global-mean gradient (DSpark loss.py:237,252).
+    The previous per-chunk/per-rank normalization gave each rank a different
+    loss scale and diverged.
 
     batch: input_ids (B,T), loss_mask (B,T), last_hidden (B,T,H),
            shared_kv_states dict of (K,V) each (B, Hkv, T, D).
     """
     import torch
+    import torch.distributed as dist
 
     input_ids = batch["input_ids"]
     loss_mask = batch["loss_mask"]
@@ -449,37 +475,31 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     flat_keep = keep_mask.reshape(N)                          # (N,)
     batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, A).reshape(N)
 
+    ddp = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if ddp else 1
+
     if int(flat_keep.sum()) == 0:
+        # No supervised anchors on THIS rank. Still take a (zero) grad path and
+        # contribute 0 to the all-reduced denominator so other ranks proceed.
         z = last_hidden.sum() * 0.0
+        den = torch.zeros((), device=device)
+        if ddp:
+            dist.all_reduce(den, op=dist.ReduceOp.SUM)
         return z, {"loss": z.detach()}
 
-    # 2. anchors on the BATCH dim: shared_kv expanded to N rows. Each anchor
-    #    must attend ONLY the target KV up to its own position (<= anchor_pos) —
-    #    NOT the future answer tokens. The cache KV is the FULL sequence, so we
-    #    broadcast it and use a per-anchor 2D mask (1 = attend, 0 = block) that
-    #    zeroes positions > anchor. Verified (probe_assistant_mask.py) the
-    #    official assistant honors this mask on the shared-KV path. Without it
-    #    the draft "sees the answer" — the leak that gave training-accept 1.0 but
-    #    bench 33%. position_ids are fixed and KV doesn't grow across TTT steps
-    #    (draft never writes KV), so the same mask applies to every step.
-    # 3. anchor-CHUNK loop. Broadcasting the full-seq KV to all N anchors and
-    #    running one forward blows up: repeat_kv expands (chunk, Hkv, T, D) to
-    #    (chunk, full_heads, T, D), and the peak scales with N*full_heads*T. So
-    #    we process anchors in small chunks: each chunk broadcasts KV only to its
-    #    rows, runs the full K-step TTT + loss, and accumulates. Peak memory
-    #    scales with chunk_size, DECOUPLED from num_anchors — this is how DSpark
-    #    keeps 128 anchors on one GPU. Loss is summed across chunks (each chunk's
-    #    step_loss already averages over its rows, so we weight by row count to
-    #    keep the global mean unbiased).
+    # 2. anchors on the BATCH dim: broadcast the full-seq KV to a chunk of rows
+    #    and use a per-anchor 2D mask (1=attend up to anchor, 0=block future) so
+    #    the draft can't see the answer. position_ids fixed at the anchor and KV
+    #    doesn't grow across TTT steps (draft writes no KV), matching vLLM's
+    #    single-anchor semantics. Anchors are processed in chunks of anchor_chunk
+    #    so peak attention memory (repeat_kv over full T) scales with chunk_size,
+    #    not num_anchors.
     kv_pos = torch.arange(T, device=device).unsqueeze(0)     # (1, T) for masks
     chunk_size = int(getattr(cfg, "anchor_chunk", 0)) or 8
-    # Fixed normalizer known BEFORE the loop, so each chunk can be normalized and
-    # back-propagated on its own (freeing its graph) without waiting for a global
-    # count. denom = (kept anchors) * K ~= total supervised steps; last-step
-    # invalid rows make this a slight over-count, negligible vs the memory win.
-    denom = max(int(flat_keep.sum()), 1) * max(K, 1)
-    total_loss = torch.zeros((), device=device)              # detached scalar log
-    # per-step accumulators for metrics (weighted by valid-row count)
+
+    total_num = torch.zeros((), device=device)               # graph-attached numerator
+    den_local = torch.zeros((), device=device)               # weighted row count
+    # per-step metric accumulators (sums; divided by per-step row counts at end)
     step_acc = {k: {"num": 0.0, "argmax_ce": 0.0, "accept": 0.0,
                     "soft_ce": 0.0, "l1": 0.0} for k in range(K)}
 
@@ -499,9 +519,8 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
 
         tok_k = input_ids[c_batch, c_anchor].unsqueeze(1)     # (nc, 1)
         hid = last_hidden[c_batch, c_anchor].unsqueeze(1)     # (nc, 1, H)
-        pos = c_anchor.unsqueeze(1)                           # (nc, 1)
+        pos = c_anchor.unsqueeze(1)                           # (nc, 1) FIXED
 
-        chunk_loss = torch.zeros((), device=device)          # graph-attached, THIS chunk
         for k in range(K):
             draft_logits, backbone_hidden = _assistant_step(
                 assistant, target_embed, None, tok_k, hid,
@@ -522,24 +541,28 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             ht_rows = input_ids[c_batch[rows], gt_idx[rows]] \
                 if cfg.hard_ce_weight > 0 else None
 
-            step_loss, sm = _anchor_loss(d_rows, th_rows, target_lm_head,
-                                         ht_rows, cfg)
-            # step_loss is a per-row MEAN; scale to a sum so chunks combine into
-            # one global mean under the fixed `denom`.
-            chunk_loss = chunk_loss + weights[k] * step_loss * nvalid
-            total_loss = total_loss + (weights[k] * step_loss * nvalid).detach()
+            # loss_num is a graph-attached SUM over the nvalid rows (NOT a mean).
+            loss_num, n, sm = _anchor_loss(d_rows, th_rows, target_lm_head,
+                                           ht_rows, cfg)
+            w = weights[k]
+            total_num = total_num + w * loss_num             # weighted numerator
+            den_local = den_local + w * n                    # weighted denominator
             a = step_acc[k]
-            a["num"] += nvalid
-            for key in ("argmax_ce", "accept", "soft_ce", "l1"):
-                src = "greedy_accept" if key == "accept" else key
-                if src in sm:
-                    a[key] += float(sm[src]) * nvalid
+            a["num"] += n
+            a["accept"] += float(sm["greedy_hit_sum"])
+            a["argmax_ce"] += float(sm["argmax_ce_sum"])
+            a["soft_ce"] += float(sm["soft_ce_sum"])
+            a["l1"] += float(sm["l1_sum"])
 
-        # Back-propagate THIS chunk now and free its graph before the next one.
-        if backward_fn is not None and chunk_loss.requires_grad:
-            backward_fn(chunk_loss / denom)
+    # Global denominator across ranks so every rank uses the same loss scale.
+    den_global = den_local.detach().clone()
+    if ddp:
+        dist.all_reduce(den_global, op=dist.ReduceOp.SUM)
+    den_global = den_global.clamp_min(1.0)
+    # x world_size: DDP averages grads across ranks, which divides by world_size;
+    # multiplying here cancels that so the result is the true global-mean grad.
+    loss = total_num / den_global * float(world_size)
 
-    total_loss = total_loss / denom
     for k in range(K):
         a = step_acc[k]
         if a["num"] == 0:
@@ -552,14 +575,5 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
         if cfg.l1_weight > 0:
             metrics[f"step{k}_l1"] = a["l1"] / a["num"]
 
-    metrics["loss"] = total_loss.detach()
-    # When backward_fn ran, grads are already accumulated; hand back the detached
-    # scalar so the caller does NOT double-backward. Otherwise return the
-    # graph-attached loss (total_loss is detached here, so rebuild it is not
-    # possible — callers without backward_fn must pass one or use small N).
-    if backward_fn is not None:
-        return total_loss, metrics
-    # No backward_fn: recompute a graph-attached loss is impossible after detach;
-    # signal by returning total_loss (detached). Callers needing grad must use
-    # backward_fn. Kept for metric-only / test use.
-    return total_loss, metrics
+    metrics["loss"] = loss.detach()
+    return loss, metrics

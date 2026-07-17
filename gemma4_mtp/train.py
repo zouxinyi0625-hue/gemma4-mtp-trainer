@@ -63,6 +63,10 @@ def parse_args():
                     help="anchors per TTT chunk; KV is broadcast only to this "
                          "many rows so peak memory is decoupled from --num-anchors. "
                          "Lower if OOM, raise for throughput.")
+    ap.add_argument("--loss-decay-gamma", type=float, default=4.0,
+                    help="per-position loss decay exp(-k/gamma): down-weights "
+                         "tail draft steps so they don't dominate. <=0 disables "
+                         "(equal weight). Matches DSpark loss_decay_gamma.")
     ap.add_argument("--argmax-ce-weight", type=float, default=1.0,
                     help="MAIN objective: CE of draft logits vs TARGET argmax "
                          "token — the differentiable proxy for vLLM's GREEDY "
@@ -255,6 +259,7 @@ def main():
         temperature=args.temperature,
         num_anchors=args.num_anchors,
         anchor_chunk=args.anchor_chunk,
+        loss_decay_gamma=args.loss_decay_gamma,
         argmax_ce_weight=args.argmax_ce_weight,
         soft_ce_weight=args.soft_ce_weight,
         l1_weight=args.l1_weight,
@@ -290,18 +295,6 @@ def main():
                 assistant_module, target_embed, target_lm_head, batch, loss_cfg)
         return training_step(target, assistant_module, batch, loss_cfg)
 
-    def manual_grad_sync():
-        """Average trainable grads across ranks (cache path back-propagates each
-        anchor chunk separately, so DDP's backward-hook sync can't be used; we
-        run every chunk under no_sync and all-reduce once here instead)."""
-        if not ddp:
-            return
-        world = float(world_size)
-        for p in trainable:
-            if p.grad is not None:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                p.grad /= world
-
     printed_baseline = False
     for epoch in range(args.epochs):
         if sampler is not None:
@@ -310,32 +303,17 @@ def main():
             batch = to_device(batch)
             is_accum_step = (i + 1) % args.grad_accum != 0
 
-            if use_cache:
-                # Cache path: back-propagate each anchor chunk inside the step so
-                # its graph frees before the next chunk (bounds peak memory to one
-                # chunk). DDP's backward hooks can't drive this, so every chunk
-                # runs under no_sync and we all-reduce manually at the accum
-                # boundary. grad_accum is folded into the chunk normalizer.
-                def bwd(chunk_loss):
-                    (chunk_loss / args.grad_accum).backward()
-                if ddp:
-                    with assistant.no_sync():
-                        _, metrics = training_step_from_cache(
-                            assistant_module, target_embed, target_lm_head,
-                            batch, loss_cfg, backward_fn=bwd)
-                else:
-                    _, metrics = training_step_from_cache(
-                        assistant_module, target_embed, target_lm_head,
-                        batch, loss_cfg, backward_fn=bwd)
-            else:
-                # DDP syncs grads on the backward of the LAST micro-step only.
-                if ddp and is_accum_step:
-                    with assistant.no_sync():
-                        loss, metrics = run_step(batch)
-                        (loss / args.grad_accum).backward()
-                else:
+            # Standard DDP path for both cache and online training. The cache
+            # loss is already globally normalized and x world_size, so DDP's
+            # gradient averaging yields the true global-mean gradient. DDP syncs
+            # grads on the backward of the LAST micro-step only.
+            if ddp and is_accum_step:
+                with assistant.no_sync():
                     loss, metrics = run_step(batch)
                     (loss / args.grad_accum).backward()
+            else:
+                loss, metrics = run_step(batch)
+                (loss / args.grad_accum).backward()
 
             # step-0 baseline: metrics from the FIRST batch reflect the loaded
             # (un-updated) model — this is the stock assistant's accept before
@@ -346,8 +324,6 @@ def main():
                 log(f"[baseline] step 0 (before any update) {msg}")
 
             if (i + 1) % args.grad_accum == 0:
-                if use_cache:
-                    manual_grad_sync()
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 optim.step()
                 sched.step()

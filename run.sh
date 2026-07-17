@@ -46,7 +46,8 @@ MAX_LENGTH="${MAX_LENGTH:-4096}"
 EPOCHS="${EPOCHS:-10}"
 LOCAL_BATCH="${LOCAL_BATCH:-2}"           # per-GPU micro-batch
 GLOBAL_BATCH="${GLOBAL_BATCH:-512}"       # dspark global_batch_size
-LR="${LR:-6e-4}"                          # dspark lr
+LR="${LR:-1e-4}"                          # fine-tuning from the pretrained MTP;
+                                          # 6e-4 (dspark from-scratch) diverges here
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 WARMUP_STEPS="${WARMUP_STEPS:-}"          # if empty, computed as 4% of total steps
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"      # dspark warmup_ratio
@@ -58,6 +59,7 @@ LOG_EVERY="${LOG_EVERY:-1}"
 # NUM_ANCHORS answer-position anchors per sequence.
 NUM_ANCHORS="${NUM_ANCHORS:-128}"
 ANCHOR_CHUNK="${ANCHOR_CHUNK:-8}"   # anchors per TTT chunk (KV broadcast width); lower if OOM
+LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-4.0}"   # exp(-k/gamma) per-position weight; tail steps down-weighted
 ARGMAX_CE="${ARGMAX_CE:-1.0}"
 SOFT_CE="${SOFT_CE:-0.0}"
 L1_WEIGHT="${L1_WEIGHT:-0.0}"   # only for rejection-sampling (temperature>0) setups
@@ -159,6 +161,7 @@ print(max(1, round(total * $WARMUP_RATIO)))
       --ttt-steps "$TTT_STEPS" \
       --num-anchors "$NUM_ANCHORS" \
       --anchor-chunk "$ANCHOR_CHUNK" \
+      --loss-decay-gamma "$LOSS_DECAY_GAMMA" \
       --argmax-ce-weight "$ARGMAX_CE" \
       --soft-ce-weight "$SOFT_CE" \
       --l1-weight "$L1_WEIGHT" \

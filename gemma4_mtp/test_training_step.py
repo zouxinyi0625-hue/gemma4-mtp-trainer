@@ -160,17 +160,21 @@ def test_fully_masked_batch_is_safe():
 
 
 def test_step_weights_normalized():
-    """Default decaying step weights sum to 1 and decrease."""
-    cfg = MTPLossConfig(ttt_steps=5, step_weight_beta=0.8)
+    """Default per-position weights are exp(-k/gamma): decreasing, w[0]==1."""
+    import math
+    cfg = MTPLossConfig(ttt_steps=5, loss_decay_gamma=4.0)
     w = compute_step_weights(cfg)
     assert len(w) == 5
-    assert abs(sum(w) - 1.0) < 1e-6, f"weights should sum to 1, got {sum(w)}"
+    assert abs(w[0] - 1.0) < 1e-6, f"w[0] should be exp(0)=1, got {w[0]}"
     assert all(w[i] > w[i+1] for i in range(4)), "weights should decay"
+    assert abs(w[1] - math.exp(-1/4.0)) < 1e-6
+    # gamma<=0 -> equal weight (no decay).
+    cfg_flat = MTPLossConfig(ttt_steps=3, loss_decay_gamma=0.0)
+    assert compute_step_weights(cfg_flat) == [1.0, 1.0, 1.0]
     # Explicit weights are passed through.
     cfg2 = MTPLossConfig(ttt_steps=3, step_weights=[1.0, 0.5, 0.25])
     assert compute_step_weights(cfg2) == [1.0, 0.5, 0.25]
-    print(f"✅ step weights normalized+decaying: "
-          f"{[round(x,3) for x in w]}")
+    print(f"✅ step weights exp-decay: {[round(x,3) for x in w]}")
 
 
 def test_collate_pads_and_aligns():
