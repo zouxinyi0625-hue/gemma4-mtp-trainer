@@ -56,12 +56,22 @@ def parse_args():
                     help="TTT draft steps to unroll (match deployment spec_tokens)")
     ap.add_argument("--step-weight-beta", type=float, default=0.8,
                     help="decay for per-step loss weights (beta**k, normalized)")
-    ap.add_argument("--soft-ce-weight", type=float, default=1.0)
+    ap.add_argument("--num-anchors", type=int, default=128,
+                    help="answer-position anchors sampled per sequence (DSpark-"
+                         "style single-anchor training). Bounds memory vs seq_len.")
+    ap.add_argument("--argmax-ce-weight", type=float, default=1.0,
+                    help="MAIN objective: CE of draft logits vs TARGET argmax "
+                         "token — the differentiable proxy for vLLM's GREEDY "
+                         "accept (draft_argmax==target_argmax).")
+    ap.add_argument("--soft-ce-weight", type=float, default=0.0,
+                    help="optional KL-to-target smoothing (default off; argmax-CE "
+                         "is the main objective)")
     ap.add_argument("--l1-weight", type=float, default=0.0,
-                    help="L1/TVD-to-target weight; accept_rate=1-0.5*L1, so this "
-                         "directly optimizes rejection-sampling acceptance "
-                         "(DSpark uses ~0.9 L1 + 0.1 CE)")
-    ap.add_argument("--hard-ce-weight", type=float, default=0.0)
+                    help="L1/TVD weight; accept_rate=1-0.5*L1 matches "
+                         "REJECTION-SAMPLING (temperature>0) accept, NOT greedy. "
+                         "Leave 0 for greedy-benchmarked setups.")
+    ap.add_argument("--hard-ce-weight", type=float, default=0.0,
+                    help="CE vs the ground-truth next token (regularizer)")
     ap.add_argument("--bf16", action="store_true", help="load models in bfloat16")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--log-every", type=int, default=10)
@@ -239,6 +249,8 @@ def main():
         ttt_steps=args.ttt_steps,
         step_weight_beta=args.step_weight_beta,
         temperature=args.temperature,
+        num_anchors=args.num_anchors,
+        argmax_ce_weight=args.argmax_ce_weight,
         soft_ce_weight=args.soft_ce_weight,
         l1_weight=args.l1_weight,
         hard_ce_weight=args.hard_ce_weight,

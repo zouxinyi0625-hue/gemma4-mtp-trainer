@@ -48,7 +48,15 @@ class MTPLossConfig:
     l1_weight: float = 0.0
     # Hard-CE against the ground-truth next token weight.
     hard_ce_weight: float = 0.0
+    # Argmax-match weight: hard-CE of draft logits against the TARGET's argmax
+    # token (top-1). This is the differentiable proxy for vLLM's GREEDY accept
+    # rule (accepted <=> draft_argmax == target_argmax). The main objective.
+    argmax_ce_weight: float = 1.0
     ignore_index: int = -100
+    # Number of answer-position anchors sampled per sequence (DSpark-style).
+    # Bounds compute/memory independent of sequence length. 0 = disabled
+    # (legacy full-sequence path).
+    num_anchors: int = 128
     # Rows per softmax chunk in _step_loss; bounds peak memory on batches with
     # many supervised tokens (the 262144-wide vocab softmax is the OOM risk).
     loss_chunk_rows: int = 1024
@@ -92,6 +100,50 @@ def locate_target_parts(target):
     return target_base, lm_head, embed, normalizer
 
 
+def sample_anchors(loss_mask, num_anchors):
+    """Sample `num_anchors` answer-position anchors per sequence (DSpark-style).
+
+    A position t is a valid anchor iff loss_mask[t]==1 AND loss_mask[t+1]==1
+    (inside the answer, and the position it predicts is also supervised). We
+    randomly pick up to num_anchors valid anchors per sequence; sequences with
+    fewer valid positions are padded (anchor_pos=0) and flagged by keep_mask.
+
+    Returns:
+      anchor_pos  (B, A) long   — sampled anchor positions (padded with 0)
+      keep_mask   (B, A) bool   — True for real anchors, False for padding
+    Ported from DSpark deepspec/modeling/dspark/common.py:109-169 (rand+sort,
+    no flex_attention needed since we isolate anchors on the batch dim).
+    """
+    import torch
+
+    B, T = loss_mask.shape
+    device = loss_mask.device
+    A = int(num_anchors)
+    num_cand = max(T - 1, 0)
+    if num_cand == 0:
+        return (torch.zeros(B, A, dtype=torch.long, device=device),
+                torch.zeros(B, A, dtype=torch.bool, device=device))
+
+    lm = loss_mask.bool()
+    valid = lm[:, :num_cand] & lm[:, 1:num_cand + 1]          # (B, num_cand)
+    valid_counts = valid.sum(dim=1)                            # (B,)
+
+    idx = torch.arange(num_cand, device=device).unsqueeze(0).expand(B, -1)
+    # Invalid positions get random key 2.0 (sorted last); valid get [0,1).
+    rand = torch.rand(B, num_cand, device=device)
+    rand = torch.where(valid, rand, torch.full_like(rand, 2.0))
+    _, order = rand.sort(dim=1)
+    gathered = torch.gather(idx, 1, order)                     # valid-first order
+    if num_cand < A:
+        pad = torch.zeros(B, A - num_cand, dtype=gathered.dtype, device=device)
+        gathered = torch.cat([gathered, pad], dim=1)
+    anchor_pos = gathered[:, :A]
+    keep_mask = torch.arange(A, device=device).unsqueeze(0) < \
+        valid_counts.unsqueeze(1).clamp(max=A)
+    anchor_pos = torch.where(keep_mask, anchor_pos, torch.zeros_like(anchor_pos))
+    return anchor_pos, keep_mask
+
+
 def build_target_signals(target, input_ids, attention_mask):
     """Frozen target forward -> last_hidden + shared_kv_states + soft-label logits.
 
@@ -125,10 +177,16 @@ def build_target_signals(target, input_ids, attention_mask):
 
 
 def _assistant_step(assistant, target_embed, normalizer, token_ids, hidden,
-                    shared_kv_states, attention_mask):
+                    shared_kv_states, attention_mask, position_ids=None):
     """One draft forward. Returns (draft_logits, backbone_hidden).
 
-    combined = concat(target_embed(token_ids) * normalizer, hidden)  # (B,T,2H)
+    combined = concat(target_embed(token_ids), hidden)  # (N, S, 2H)
+
+    In anchor mode, token_ids/hidden are (N, 1, ...) — one row per anchor on the
+    BATCH dim — and position_ids (N, 1) pins each anchor to its fixed position so
+    the draft attends only the target KV up to that anchor (vLLM single-anchor
+    semantics; anchors are isolated on the batch dim so they never attend each
+    other).
     """
     import torch
 
@@ -137,97 +195,124 @@ def _assistant_step(assistant, target_embed, normalizer, token_ids, hidden,
     # internally (embed_scale). Multiplying again would over-scale by ~53x and
     # destroy the draft (confirmed vs transformers v5.13.0 modeling_gemma4
     # line 1608 + official SinglePositionMultiTokenCandidateGenerator).
-    tok_embed = target_embed(token_ids)                       # (B, T, H)
-    combined = torch.cat([tok_embed, hidden], dim=-1)          # (B, T, 2H)
+    tok_embed = target_embed(token_ids)                       # (N, S, H)
+    combined = torch.cat([tok_embed, hidden], dim=-1)          # (N, S, 2H)
     out = assistant(
         inputs_embeds=combined,
         shared_kv_states=shared_kv_states,
-        position_ids=None,
+        position_ids=position_ids,
         attention_mask=attention_mask,
     )
     return out.logits, out.last_hidden_state
 
 
 def _step_loss(draft_logits, target_hidden, target_lm_head, hard_targets, mask, cfg):
-    """Distillation loss at one aligned draft step. Combines:
+    """Distillation loss at one aligned draft step (legacy full-sequence path).
 
-      - soft-CE (KL to target)          weight cfg.soft_ce_weight
-      - L1 / TVD to target              weight cfg.l1_weight   <- accept-rate lever
-      - hard-CE to ground truth         weight cfg.hard_ce_weight
+    Kept for the online training_step. The anchor path uses _anchor_loss.
+    Combines soft-CE (KL), L1/TVD, hard-CE-to-ground-truth, and argmax-CE. The
+    MAIN objective is now argmax-CE (cfg.argmax_ce_weight): hard-CE of the draft
+    against the TARGET's argmax token — the differentiable proxy for vLLM's
+    GREEDY accept rule (accepted <=> draft_argmax == target_argmax). L1/TVD only
+    matches the rejection-sampling accept rate (temperature>0), NOT greedy.
 
-    Why L1 (from DSpark deepspec/modeling/dspark/loss.py): for rejection
-    sampling the EXACT expected acceptance rate is  1 - TVD(draft, target)  =
-    1 - 0.5 * L1(draft_probs, target_probs). So minimizing L1 directly
-    maximizes the real acceptance rate — a tighter objective than KL, which
-    matches the whole distribution shape rather than the accept probability.
-    DSpark uses 0.9*L1 + 0.1*CE. We report a differentiable accept_rate metric
-    (1 - 0.5*L1) so training can be monitored against the quantity we care about.
-
-    Memory: target logits are computed ONLY on supervised rows (gather the
-    (n_sup, H) hidden first, then lm_head), never the full (B, L, 262144) — that
-    full materialization was the OOM. Both target and draft are then chunked
-    over rows so peak memory is bounded regardless of how many tokens a batch
-    supervises (mean = sum / n_sup, numerically identical).
+    Memory: target logits computed ONLY on supervised rows, chunked.
     """
     import torch
     import torch.nn.functional as F
 
     temp = cfg.temperature
     l1_weight = float(getattr(cfg, "l1_weight", 0.0))
+    argmax_w = float(getattr(cfg, "argmax_ce_weight", 0.0))
     B, L, V = draft_logits.shape
     H = target_hidden.shape[-1]
-    flat_mask = mask.reshape(-1).bool()                        # (B*L,)
+    flat_mask = mask.reshape(-1).bool()
     n_sup = int(flat_mask.sum())
     if n_sup == 0:
-        # No supervised tokens this step; return a differentiable zero.
         z = draft_logits.sum() * 0.0
         return z, {"soft_ce": z.detach()}
-
     d_flat = draft_logits.reshape(-1, V)[flat_mask]            # (n_sup, V)
-    # Gather supervised hidden rows FIRST (n_sup, H) — small — then compute
-    # target logits per-chunk below. Never materialize (B, L, V) target logits.
     th_flat = target_hidden.reshape(-1, H)[flat_mask]          # (n_sup, H)
     if cfg.hard_ce_weight > 0:
-        ht_flat = hard_targets.reshape(-1)[flat_mask]          # (n_sup,)
+        ht_flat = hard_targets.reshape(-1)[flat_mask]
+    return _anchor_loss(d_flat, th_flat, target_lm_head,
+                        ht_flat if cfg.hard_ce_weight > 0 else None, cfg)
 
-    # Rows per softmax chunk. ~1024 rows x 262144 x 4B ~= 1GB per activation;
-    # bounds peak memory regardless of how many tokens a batch supervises.
+
+def _anchor_loss(d_flat, th_flat, target_lm_head, ht_flat, cfg):
+    """Loss over N gathered draft rows (N, V) vs target hidden (N, H).
+
+    MAIN objective: argmax-CE — cross-entropy of draft logits against the
+    target's argmax token (top-1). This is the differentiable proxy for vLLM's
+    greedy accept (accepted <=> draft_argmax == target_argmax). Optional
+    soft-CE (KL), L1/TVD, and hard-CE-to-ground-truth are added by weight.
+
+    Reports greedy_accept = mean(draft_argmax == target_argmax) — the exact
+    (non-differentiable) quantity vLLM's bench measures, for monitoring.
+    Target logits computed per-chunk (never full N x 262144 at once).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    temp = cfg.temperature
+    l1_weight = float(getattr(cfg, "l1_weight", 0.0))
+    argmax_w = float(getattr(cfg, "argmax_ce_weight", 0.0))
+    N = d_flat.shape[0]
+    if N == 0:
+        z = d_flat.sum() * 0.0
+        return z, {"argmax_ce": z.detach()}
+
     chunk = int(getattr(cfg, "loss_chunk_rows", 1024))
-    soft_ce_sum = draft_logits.new_zeros(())
-    hard_ce_sum = draft_logits.new_zeros(())
-    l1_sum = draft_logits.new_zeros(())
-    for start in range(0, n_sup, chunk):
-        d = d_flat[start:start + chunk]                        # (c, V)
-        # target logits for this chunk only — (c, H) @ lm_head -> (c, V).
+    soft_ce_sum = d_flat.new_zeros(())
+    hard_ce_sum = d_flat.new_zeros(())
+    argmax_ce_sum = d_flat.new_zeros(())
+    l1_sum = d_flat.new_zeros(())
+    greedy_hit_sum = d_flat.new_zeros(())
+    for s in range(0, N, chunk):
+        d = d_flat[s:s + chunk]                                # (c, V)
         with torch.no_grad():
-            t = target_lm_head(th_flat[start:start + chunk])   # (c, V)
+            t = target_lm_head(th_flat[s:s + chunk])           # (c, V)
+            t_argmax = t.argmax(dim=-1)                        # (c,)
+        log_p = F.log_softmax(d, dim=-1)
+        # MAIN: argmax-CE — push draft's distribution mass onto target's top-1.
+        if argmax_w > 0:
+            argmax_ce_sum = argmax_ce_sum + F.nll_loss(
+                log_p, t_argmax, reduction="sum")
+        # greedy accept monitor (non-diff): fraction where argmaxes agree.
         with torch.no_grad():
-            soft_t = F.softmax(t / temp, dim=-1)
-        log_p = F.log_softmax(d / temp, dim=-1)
-        # sum over vocab, sum over rows (divide by n_sup at the end -> mean).
-        soft_ce_sum = soft_ce_sum + -(soft_t * log_p).sum(dim=-1).sum() * (temp * temp)
+            greedy_hit_sum = greedy_hit_sum + (
+                d.argmax(dim=-1) == t_argmax).sum()
+        if cfg.soft_ce_weight > 0:
+            with torch.no_grad():
+                soft_t = F.softmax(t / temp, dim=-1)
+            lp = F.log_softmax(d / temp, dim=-1)
+            soft_ce_sum = soft_ce_sum + -(soft_t * lp).sum(-1).sum() * (temp * temp)
         if l1_weight > 0:
-            # L1 uses UNtempered probs (the acceptance rate is defined on the
-            # actual sampling distribution, temperature 1).
             dp = F.softmax(d, dim=-1)
             with torch.no_grad():
                 tp = F.softmax(t, dim=-1)
-            l1_sum = l1_sum + (dp - tp).abs().sum(dim=-1).sum()
-        if cfg.hard_ce_weight > 0:
+            l1_sum = l1_sum + (dp - tp).abs().sum(-1).sum()
+        if cfg.hard_ce_weight > 0 and ht_flat is not None:
             hard_ce_sum = hard_ce_sum + F.cross_entropy(
-                d, ht_flat[start:start + chunk], reduction="sum")
+                d, ht_flat[s:s + chunk], reduction="sum")
 
-    soft_ce = soft_ce_sum / n_sup
-    total = cfg.soft_ce_weight * soft_ce
-    out = {"soft_ce": soft_ce.detach()}
+    total = d_flat.new_zeros(())
+    out = {"greedy_accept": (greedy_hit_sum / N).detach()}
+    if argmax_w > 0:
+        argmax_ce = argmax_ce_sum / N
+        total = total + argmax_w * argmax_ce
+        out["argmax_ce"] = argmax_ce.detach()
+    if cfg.soft_ce_weight > 0:
+        soft_ce = soft_ce_sum / N
+        total = total + cfg.soft_ce_weight * soft_ce
+        out["soft_ce"] = soft_ce.detach()
     if l1_weight > 0:
-        l1 = l1_sum / n_sup
+        l1 = l1_sum / N
         total = total + l1_weight * l1
         out["l1"] = l1.detach()
-        # accept_rate = 1 - TVD = 1 - 0.5*L1  (differentiable estimate)
         out["accept_rate"] = (1.0 - 0.5 * l1).detach()
-    if cfg.hard_ce_weight > 0:
-        hard_ce = hard_ce_sum / n_sup
+    if cfg.hard_ce_weight > 0 and ht_flat is not None:
+        hard_ce = hard_ce_sum / N
         total = total + cfg.hard_ce_weight * hard_ce
         out["hard_ce"] = hard_ce.detach()
     return total, out
@@ -298,12 +383,8 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
             hard_targets_k, mask_k, cfg,
         )
         total_loss = total_loss + weights[k] * step_loss
-        metrics[f"step{k}_soft_ce"] = step_metrics["soft_ce"]
-        if "hard_ce" in step_metrics:
-            metrics[f"step{k}_hard_ce"] = step_metrics["hard_ce"]
-        if "l1" in step_metrics:
-            metrics[f"step{k}_l1"] = step_metrics["l1"]
-            metrics[f"step{k}_accept"] = step_metrics["accept_rate"]
+        for mk, mv in step_metrics.items():
+            metrics[f"step{k}_{mk}"] = mv
 
         # Recurrent feedback: next step consumes this step's backbone hidden.
         # backbone_hidden is indexed by t (query position); pad back to full T
@@ -318,75 +399,99 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
 def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
                              cfg: MTPLossConfig):
-    """TTT training step using PRECOMPUTED target signals (no 26B forward).
+    """Single-anchor TTT training from PRECOMPUTED target signals (no 26B).
 
-    batch (from the cache collate) provides:
-      input_ids   (B, T)          loss_mask   (B, T)
-      last_hidden (B, T, H)        shared_kv_states dict of (K,V)
-    Target soft labels are recomputed on the fly as target_lm_head(last_hidden)
-    ONLY on supervised positions (inside _step_loss, after masking). lm_head is
-    frozen (tied to embed), so this is a cheap matmul and gives the FULL target
-    distribution. Only the assistant is trained.
+    Matches vLLM inference (SinglePositionMultiTokenCandidateGenerator):
+    sample answer-position anchors, and for each anchor run k autoregressive
+    draft steps at a FIXED position, attending only the target KV. Anchors are
+    laid out on the BATCH dim (N = B*A rows, seq_len 1 each) so they are
+    naturally isolated — they never attend each other, exactly like vLLM's
+    per-request drafts. Compute/memory scale with num_anchors, NOT seq_len.
+
+    Objective: argmax-CE (draft logits vs target argmax) — the differentiable
+    proxy for vLLM's greedy accept rule. See _anchor_loss.
+
+    batch: input_ids (B,T), loss_mask (B,T), last_hidden (B,T,H),
+           shared_kv_states dict of (K,V) each (B, Hkv, T, D).
     """
     import torch
 
     input_ids = batch["input_ids"]
     loss_mask = batch["loss_mask"]
-    last_hidden = batch["last_hidden"]
+    last_hidden = batch["last_hidden"]                        # (B, T, H)
     shared_kv_states = batch["shared_kv_states"]
     B, T = input_ids.shape
+    H = last_hidden.shape[-1]
+    device = input_ids.device
 
+    A = int(cfg.num_anchors)
     weights = compute_step_weights(cfg)
     K = cfg.ttt_steps
-    total_loss = torch.zeros((), device=input_ids.device)
     metrics: dict[str, object] = {}
-    hidden = last_hidden
-    prev_draft_tokens = None      # step k-1's argmax token ids (B, L_prev), tiny
 
+    # 1. sample anchors on answer positions -> (B, A), keep_mask (B, A)
+    anchor_pos, keep_mask = sample_anchors(loss_mask, A)
+    N = B * A
+    flat_anchor = anchor_pos.reshape(N)                       # (N,)
+    flat_keep = keep_mask.reshape(N)                          # (N,)
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, A).reshape(N)
+
+    if int(flat_keep.sum()) == 0:
+        z = last_hidden.sum() * 0.0
+        return z, {"loss": z.detach()}
+
+    # 2. anchors on the BATCH dim: shared_kv expanded to N rows (each anchor
+    #    sees the same target KV; position_ids pin it to its anchor position so
+    #    attention only reaches context < anchor_pos).
+    def expand_kv(kv):
+        k, v = kv                                             # (B, Hkv, T, D)
+        k = k[batch_idx]                                     # (N, Hkv, T, D)
+        v = v[batch_idx]
+        return (k, v)
+    kv_N = {kt: expand_kv(kv) for kt, kv in shared_kv_states.items()}
+
+    # step-0 inputs, all gathered to (N, 1, ...)
+    tok0 = input_ids[batch_idx, flat_anchor].unsqueeze(1)    # (N, 1) token at anchor
+    hid = last_hidden[batch_idx, flat_anchor].unsqueeze(1)   # (N, 1, H) target hidden
+    pos = flat_anchor.unsqueeze(1)                           # (N, 1) fixed position
+
+    total_loss = torch.zeros((), device=device)
+    prev_tokens = None
     for k in range(K):
-        L = T - k - 1
-        if L <= 0:
-            break
         if k == 0:
-            # Step 0 consumes the real next token (vLLM step0 consumes the
-            # target's freshly sampled token; ground-truth is its stand-in).
-            token_ids_k = input_ids[:, 0:L]
+            token_k = tok0
         else:
-            # Steps k>0 consume the DRAFT's OWN previous prediction, matching
-            # vLLM inference (llm_base_proposer.py:574) — not ground truth.
-            # Position j at step k-1 predicts the token position j consumes at
-            # step k, so the prev argmax sliced to this step's shorter window
-            # aligns. We keep only the argmax token ids (B, L) from the previous
-            # step — NOT the full (B, L, V) logits — so the big logits tensor is
-            # freed after its loss each step (avoids TTT-depth OOM).
-            token_ids_k = prev_draft_tokens[:, :L]
-        hidden_k = hidden[:, :L, :]
+            token_k = prev_tokens                            # (N, 1) draft's own argmax
         draft_logits, backbone_hidden = _assistant_step(
-            assistant, target_embed, None, token_ids_k, hidden_k,
-            shared_kv_states, None)
-        prev_draft_tokens = draft_logits.argmax(dim=-1).detach()
-        hard_targets_k = input_ids[:, k + 1:k + 1 + L]
-        mask_k = loss_mask[:, k + 1:k + 1 + L]
+            assistant, target_embed, None, token_k, hid,
+            kv_N, None, position_ids=pos)                    # (N,1,V), (N,1,H)
+        prev_tokens = draft_logits.argmax(dim=-1).detach()   # (N, 1)
+        hid = backbone_hidden                                # feed back (N,1,H)
 
-        # Target soft labels come from lm_head over the TARGET's cached hidden
-        # at the supervised positions [k, k+L). We pass the hidden slice (not
-        # full logits) so _step_loss computes target logits ONLY on masked rows.
-        tgt_hidden_k = last_hidden[:, k:k + L, :]                  # (B, L, H)
+        # Supervision: anchor a at step k predicts token a+k+1; the aligned
+        # target distribution is lm_head(last_hidden[a+k]). Keep rows where
+        # (a+k) is a valid supervised position (inside answer, within seq).
+        tgt_idx = (flat_anchor + k).clamp(max=T - 1)         # (N,)
+        step_valid = flat_keep & ((flat_anchor + k) < T) & \
+            (loss_mask[batch_idx, tgt_idx] > 0)
+        if int(step_valid.sum()) == 0:
+            continue
+        rows = step_valid.nonzero(as_tuple=True)[0]
+        d_rows = draft_logits[:, 0, :][rows]                 # (n, V)
+        th_rows = last_hidden[batch_idx[rows], tgt_idx[rows]]  # (n, H)
+        # hard-CE-to-ground-truth target = the actual next token a+k+1
+        gt_idx = (flat_anchor + k + 1).clamp(max=T - 1)
+        ht_rows = input_ids[batch_idx[rows], gt_idx[rows]] if cfg.hard_ce_weight > 0 else None
 
-        step_loss, sm = _step_loss(
-            draft_logits, tgt_hidden_k, target_lm_head,
-            hard_targets_k, mask_k, cfg)
+        step_loss, sm = _anchor_loss(d_rows, th_rows, target_lm_head, ht_rows, cfg)
         total_loss = total_loss + weights[k] * step_loss
-        metrics[f"step{k}_soft_ce"] = sm["soft_ce"]
-        if "hard_ce" in sm:
-            metrics[f"step{k}_hard_ce"] = sm["hard_ce"]
+        if "argmax_ce" in sm:
+            metrics[f"step{k}_argmax_ce"] = sm["argmax_ce"]
+        metrics[f"step{k}_accept"] = sm["greedy_accept"]
+        if "soft_ce" in sm:
+            metrics[f"step{k}_soft_ce"] = sm["soft_ce"]
         if "l1" in sm:
             metrics[f"step{k}_l1"] = sm["l1"]
-            metrics[f"step{k}_accept"] = sm["accept_rate"]
-
-        if k + 1 < K:
-            pad = last_hidden[:, L:, :]
-            hidden = torch.cat([backbone_hidden, pad], dim=1)
 
     metrics["loss"] = total_loss.detach()
     return total_loss, metrics
