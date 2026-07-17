@@ -440,15 +440,22 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
         z = last_hidden.sum() * 0.0
         return z, {"loss": z.detach()}
 
-    # 2. anchors on the BATCH dim: shared_kv expanded to N rows (each anchor
-    #    sees the same target KV; position_ids pin it to its anchor position so
-    #    attention only reaches context < anchor_pos).
+    # 2. anchors on the BATCH dim: shared_kv expanded to N rows. Each anchor
+    #    must attend ONLY the target KV up to its own position (<= anchor_pos) —
+    #    NOT the future answer tokens. The cache KV is the FULL sequence, so we
+    #    broadcast it and use a per-anchor 2D mask (1 = attend, 0 = block) that
+    #    zeroes positions > anchor. Verified (probe_assistant_mask.py) the
+    #    official assistant honors this mask on the shared-KV path. Without it
+    #    the draft "sees the answer" — the leak that gave training-accept 1.0 but
+    #    bench 33%. position_ids are fixed and KV doesn't grow across TTT steps
+    #    (draft never writes KV), so the same mask applies to every step.
     def expand_kv(kv):
         k, v = kv                                             # (B, Hkv, T, D)
-        k = k[batch_idx]                                     # (N, Hkv, T, D)
-        v = v[batch_idx]
-        return (k, v)
+        return (k[batch_idx], v[batch_idx])                  # (N, Hkv, T, D)
     kv_N = {kt: expand_kv(kv) for kt, kv in shared_kv_states.items()}
+    # (N, T): row for anchor a is [1..1 (<=a), 0..0 (>a)]
+    kv_pos = torch.arange(T, device=device).unsqueeze(0)     # (1, T)
+    attn_mask_N = (kv_pos <= flat_anchor.unsqueeze(1)).to(last_hidden.dtype)  # (N, T)
 
     # step-0 inputs, all gathered to (N, 1, ...)
     tok0 = input_ids[batch_idx, flat_anchor].unsqueeze(1)    # (N, 1) token at anchor
@@ -464,7 +471,7 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             token_k = prev_tokens                            # (N, 1) draft's own argmax
         draft_logits, backbone_hidden = _assistant_step(
             assistant, target_embed, None, token_k, hid,
-            kv_N, None, position_ids=pos)                    # (N,1,V), (N,1,H)
+            kv_N, attn_mask_N, position_ids=pos)             # (N,1,V), (N,1,H)
         prev_tokens = draft_logits.argmax(dim=-1).detach()   # (N, 1)
         hid = backbone_hidden                                # feed back (N,1,H)
 
