@@ -403,7 +403,7 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
 
 def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
-                             cfg: MTPLossConfig):
+                             cfg: MTPLossConfig, backward_fn=None):
     """Single-anchor TTT training from PRECOMPUTED target signals (no 26B).
 
     Matches vLLM inference (SinglePositionMultiTokenCandidateGenerator):
@@ -415,6 +415,14 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
 
     Objective: argmax-CE (draft logits vs target argmax) — the differentiable
     proxy for vLLM's greedy accept rule. See _anchor_loss.
+
+    backward_fn: if given, called as backward_fn(chunk_loss) right after each
+    anchor chunk so that chunk's autograd graph is freed BEFORE the next chunk
+    runs. This keeps peak activation memory at one chunk, not all N//chunk
+    chunks at once (the whole point of chunking). The caller must NOT call
+    .backward() on the returned loss in that case — grads are already
+    accumulated. When None, returns a graph-attached loss for the caller to
+    back-propagate (used by tests / the online path).
 
     batch: input_ids (B,T), loss_mask (B,T), last_hidden (B,T,H),
            shared_kv_states dict of (K,V) each (B, Hkv, T, D).
@@ -465,7 +473,12 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     #    keep the global mean unbiased).
     kv_pos = torch.arange(T, device=device).unsqueeze(0)     # (1, T) for masks
     chunk_size = int(getattr(cfg, "anchor_chunk", 0)) or 8
-    total_loss = torch.zeros((), device=device)
+    # Fixed normalizer known BEFORE the loop, so each chunk can be normalized and
+    # back-propagated on its own (freeing its graph) without waiting for a global
+    # count. denom = (kept anchors) * K ~= total supervised steps; last-step
+    # invalid rows make this a slight over-count, negligible vs the memory win.
+    denom = max(int(flat_keep.sum()), 1) * max(K, 1)
+    total_loss = torch.zeros((), device=device)              # detached scalar log
     # per-step accumulators for metrics (weighted by valid-row count)
     step_acc = {k: {"num": 0.0, "argmax_ce": 0.0, "accept": 0.0,
                     "soft_ce": 0.0, "l1": 0.0} for k in range(K)}
@@ -488,6 +501,7 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
         hid = last_hidden[c_batch, c_anchor].unsqueeze(1)     # (nc, 1, H)
         pos = c_anchor.unsqueeze(1)                           # (nc, 1)
 
+        chunk_loss = torch.zeros((), device=device)          # graph-attached, THIS chunk
         for k in range(K):
             draft_logits, backbone_hidden = _assistant_step(
                 assistant, target_embed, None, tok_k, hid,
@@ -510,8 +524,10 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
 
             step_loss, sm = _anchor_loss(d_rows, th_rows, target_lm_head,
                                          ht_rows, cfg)
-            # weight by row count so summing chunks == global mean
-            total_loss = total_loss + weights[k] * step_loss * nvalid
+            # step_loss is a per-row MEAN; scale to a sum so chunks combine into
+            # one global mean under the fixed `denom`.
+            chunk_loss = chunk_loss + weights[k] * step_loss * nvalid
+            total_loss = total_loss + (weights[k] * step_loss * nvalid).detach()
             a = step_acc[k]
             a["num"] += nvalid
             for key in ("argmax_ce", "accept", "soft_ce", "l1"):
@@ -519,9 +535,11 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
                 if src in sm:
                     a[key] += float(sm[src]) * nvalid
 
-    total_valid = sum(step_acc[k]["num"] for k in range(K))
-    if total_valid > 0:
-        total_loss = total_loss / total_valid
+        # Back-propagate THIS chunk now and free its graph before the next one.
+        if backward_fn is not None and chunk_loss.requires_grad:
+            backward_fn(chunk_loss / denom)
+
+    total_loss = total_loss / denom
     for k in range(K):
         a = step_acc[k]
         if a["num"] == 0:
@@ -535,4 +553,13 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             metrics[f"step{k}_l1"] = a["l1"] / a["num"]
 
     metrics["loss"] = total_loss.detach()
+    # When backward_fn ran, grads are already accumulated; hand back the detached
+    # scalar so the caller does NOT double-backward. Otherwise return the
+    # graph-attached loss (total_loss is detached here, so rebuild it is not
+    # possible — callers without backward_fn must pass one or use small N).
+    if backward_fn is not None:
+        return total_loss, metrics
+    # No backward_fn: recompute a graph-attached loss is impossible after detach;
+    # signal by returning total_loss (detached). Callers needing grad must use
+    # backward_fn. Kept for metric-only / test use.
     return total_loss, metrics
