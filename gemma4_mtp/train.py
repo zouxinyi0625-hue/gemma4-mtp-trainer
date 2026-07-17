@@ -272,6 +272,8 @@ def main():
     assistant.train()
     step = 0
     optim.zero_grad()
+    import time
+    train_start = time.time()
     def to_device(batch):
         out = {}
         for k, v in batch.items():
@@ -355,7 +357,14 @@ def main():
                 if step % args.log_every == 0:
                     lr = sched.get_last_lr()[0]
                     msg = " ".join(f"{k}={float(v):.4f}" for k, v in metrics.items())
-                    log(f"epoch {epoch} step {step}/{total_steps} lr={lr:.2e} {msg}")
+                    elapsed = time.time() - train_start
+                    per_step = elapsed / max(step, 1)
+                    eta = per_step * max(total_steps - step, 0)
+                    def _hms(s):
+                        s = int(s)
+                        return f"{s // 3600:d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+                    log(f"epoch {epoch} step {step}/{total_steps} lr={lr:.2e} "
+                        f"{msg} | {per_step:.1f}s/step eta {_hms(eta)}")
                 if args.save_every and step % args.save_every == 0:
                     # All ranks sync first, then rank0 saves alone while the
                     # others wait at the next barrier — keeps rank0's slow-mount
