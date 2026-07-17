@@ -60,6 +60,11 @@ class MTPLossConfig:
     # Rows per softmax chunk in _step_loss; bounds peak memory on batches with
     # many supervised tokens (the 262144-wide vocab softmax is the OOM risk).
     loss_chunk_rows: int = 1024
+    # Anchors processed per chunk in the cache TTT loop. The full-seq KV is
+    # broadcast only to chunk_size rows (repeat_kv peak scales with this, NOT
+    # with num_anchors), so this decouples memory from num_anchors. Lower it if
+    # you still OOM; raise it for throughput.
+    anchor_chunk: int = 8
 
 
 def compute_step_weights(cfg: MTPLossConfig) -> list[float]:
@@ -449,56 +454,85 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     #    the draft "sees the answer" — the leak that gave training-accept 1.0 but
     #    bench 33%. position_ids are fixed and KV doesn't grow across TTT steps
     #    (draft never writes KV), so the same mask applies to every step.
-    def expand_kv(kv):
-        k, v = kv                                             # (B, Hkv, T, D)
-        return (k[batch_idx], v[batch_idx])                  # (N, Hkv, T, D)
-    kv_N = {kt: expand_kv(kv) for kt, kv in shared_kv_states.items()}
-    # (N, T): row for anchor a is [1..1 (<=a), 0..0 (>a)]
-    kv_pos = torch.arange(T, device=device).unsqueeze(0)     # (1, T)
-    attn_mask_N = (kv_pos <= flat_anchor.unsqueeze(1)).to(last_hidden.dtype)  # (N, T)
-
-    # step-0 inputs, all gathered to (N, 1, ...)
-    tok0 = input_ids[batch_idx, flat_anchor].unsqueeze(1)    # (N, 1) token at anchor
-    hid = last_hidden[batch_idx, flat_anchor].unsqueeze(1)   # (N, 1, H) target hidden
-    pos = flat_anchor.unsqueeze(1)                           # (N, 1) fixed position
-
+    # 3. anchor-CHUNK loop. Broadcasting the full-seq KV to all N anchors and
+    #    running one forward blows up: repeat_kv expands (chunk, Hkv, T, D) to
+    #    (chunk, full_heads, T, D), and the peak scales with N*full_heads*T. So
+    #    we process anchors in small chunks: each chunk broadcasts KV only to its
+    #    rows, runs the full K-step TTT + loss, and accumulates. Peak memory
+    #    scales with chunk_size, DECOUPLED from num_anchors — this is how DSpark
+    #    keeps 128 anchors on one GPU. Loss is summed across chunks (each chunk's
+    #    step_loss already averages over its rows, so we weight by row count to
+    #    keep the global mean unbiased).
+    kv_pos = torch.arange(T, device=device).unsqueeze(0)     # (1, T) for masks
+    chunk_size = int(getattr(cfg, "anchor_chunk", 0)) or 8
     total_loss = torch.zeros((), device=device)
-    prev_tokens = None
-    for k in range(K):
-        if k == 0:
-            token_k = tok0
-        else:
-            token_k = prev_tokens                            # (N, 1) draft's own argmax
-        draft_logits, backbone_hidden = _assistant_step(
-            assistant, target_embed, None, token_k, hid,
-            kv_N, attn_mask_N, position_ids=pos)             # (N,1,V), (N,1,H)
-        prev_tokens = draft_logits.argmax(dim=-1).detach()   # (N, 1)
-        hid = backbone_hidden                                # feed back (N,1,H)
+    # per-step accumulators for metrics (weighted by valid-row count)
+    step_acc = {k: {"num": 0.0, "argmax_ce": 0.0, "accept": 0.0,
+                    "soft_ce": 0.0, "l1": 0.0} for k in range(K)}
 
-        # Supervision: anchor a at step k predicts token a+k+1; the aligned
-        # target distribution is lm_head(last_hidden[a+k]). Keep rows where
-        # (a+k) is a valid supervised position (inside answer, within seq).
-        tgt_idx = (flat_anchor + k).clamp(max=T - 1)         # (N,)
-        step_valid = flat_keep & ((flat_anchor + k) < T) & \
-            (loss_mask[batch_idx, tgt_idx] > 0)
-        if int(step_valid.sum()) == 0:
+    for c0 in range(0, N, chunk_size):
+        c1 = min(c0 + chunk_size, N)
+        cidx = torch.arange(c0, c1, device=device)           # rows in this chunk
+        c_batch = batch_idx[cidx]                            # (nc,)
+        c_anchor = flat_anchor[cidx]                         # (nc,)
+        c_keep = flat_keep[cidx]                             # (nc,)
+        if int(c_keep.sum()) == 0:
             continue
-        rows = step_valid.nonzero(as_tuple=True)[0]
-        d_rows = draft_logits[:, 0, :][rows]                 # (n, V)
-        th_rows = last_hidden[batch_idx[rows], tgt_idx[rows]]  # (n, H)
-        # hard-CE-to-ground-truth target = the actual next token a+k+1
-        gt_idx = (flat_anchor + k + 1).clamp(max=T - 1)
-        ht_rows = input_ids[batch_idx[rows], gt_idx[rows]] if cfg.hard_ce_weight > 0 else None
 
-        step_loss, sm = _anchor_loss(d_rows, th_rows, target_lm_head, ht_rows, cfg)
-        total_loss = total_loss + weights[k] * step_loss
-        if "argmax_ce" in sm:
-            metrics[f"step{k}_argmax_ce"] = sm["argmax_ce"]
-        metrics[f"step{k}_accept"] = sm["greedy_accept"]
-        if "soft_ce" in sm:
-            metrics[f"step{k}_soft_ce"] = sm["soft_ce"]
-        if "l1" in sm:
-            metrics[f"step{k}_l1"] = sm["l1"]
+        # KV broadcast to THIS chunk only + per-anchor future mask.
+        kv_c = {kt: (kv[0][c_batch], kv[1][c_batch])
+                for kt, kv in shared_kv_states.items()}       # (nc, Hkv, T, D)
+        mask_c = (kv_pos <= c_anchor.unsqueeze(1)).to(last_hidden.dtype)  # (nc, T)
+
+        tok_k = input_ids[c_batch, c_anchor].unsqueeze(1)     # (nc, 1)
+        hid = last_hidden[c_batch, c_anchor].unsqueeze(1)     # (nc, 1, H)
+        pos = c_anchor.unsqueeze(1)                           # (nc, 1)
+
+        for k in range(K):
+            draft_logits, backbone_hidden = _assistant_step(
+                assistant, target_embed, None, tok_k, hid,
+                kv_c, mask_c, position_ids=pos)               # (nc,1,V),(nc,1,H)
+            tok_k = draft_logits.argmax(dim=-1).detach()      # (nc, 1) next input
+            hid = backbone_hidden
+
+            tgt_idx = (c_anchor + k).clamp(max=T - 1)         # (nc,)
+            step_valid = c_keep & ((c_anchor + k) < T) & \
+                (loss_mask[c_batch, tgt_idx] > 0)
+            nvalid = int(step_valid.sum())
+            if nvalid == 0:
+                continue
+            rows = step_valid.nonzero(as_tuple=True)[0]
+            d_rows = draft_logits[:, 0, :][rows]              # (n, V)
+            th_rows = last_hidden[c_batch[rows], tgt_idx[rows]]  # (n, H)
+            gt_idx = (c_anchor + k + 1).clamp(max=T - 1)
+            ht_rows = input_ids[c_batch[rows], gt_idx[rows]] \
+                if cfg.hard_ce_weight > 0 else None
+
+            step_loss, sm = _anchor_loss(d_rows, th_rows, target_lm_head,
+                                         ht_rows, cfg)
+            # weight by row count so summing chunks == global mean
+            total_loss = total_loss + weights[k] * step_loss * nvalid
+            a = step_acc[k]
+            a["num"] += nvalid
+            for key in ("argmax_ce", "accept", "soft_ce", "l1"):
+                src = "greedy_accept" if key == "accept" else key
+                if src in sm:
+                    a[key] += float(sm[src]) * nvalid
+
+    total_valid = sum(step_acc[k]["num"] for k in range(K))
+    if total_valid > 0:
+        total_loss = total_loss / total_valid
+    for k in range(K):
+        a = step_acc[k]
+        if a["num"] == 0:
+            continue
+        metrics[f"step{k}_accept"] = a["accept"] / a["num"]
+        if cfg.argmax_ce_weight > 0:
+            metrics[f"step{k}_argmax_ce"] = a["argmax_ce"] / a["num"]
+        if cfg.soft_ce_weight > 0:
+            metrics[f"step{k}_soft_ce"] = a["soft_ce"] / a["num"]
+        if cfg.l1_weight > 0:
+            metrics[f"step{k}_l1"] = a["l1"] / a["num"]
 
     metrics["loss"] = total_loss.detach()
     return total_loss, metrics

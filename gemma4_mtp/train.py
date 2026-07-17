@@ -59,6 +59,10 @@ def parse_args():
     ap.add_argument("--num-anchors", type=int, default=128,
                     help="answer-position anchors sampled per sequence (DSpark-"
                          "style single-anchor training). Bounds memory vs seq_len.")
+    ap.add_argument("--anchor-chunk", type=int, default=8,
+                    help="anchors per TTT chunk; KV is broadcast only to this "
+                         "many rows so peak memory is decoupled from --num-anchors. "
+                         "Lower if OOM, raise for throughput.")
     ap.add_argument("--argmax-ce-weight", type=float, default=1.0,
                     help="MAIN objective: CE of draft logits vs TARGET argmax "
                          "token — the differentiable proxy for vLLM's GREEDY "
@@ -250,6 +254,7 @@ def main():
         step_weight_beta=args.step_weight_beta,
         temperature=args.temperature,
         num_anchors=args.num_anchors,
+        anchor_chunk=args.anchor_chunk,
         argmax_ce_weight=args.argmax_ce_weight,
         soft_ce_weight=args.soft_ce_weight,
         l1_weight=args.l1_weight,

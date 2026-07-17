@@ -57,6 +57,7 @@ LOG_EVERY="${LOG_EVERY:-10}"
 # accept: draft_argmax == target_argmax). Single-anchor training with
 # NUM_ANCHORS answer-position anchors per sequence.
 NUM_ANCHORS="${NUM_ANCHORS:-128}"
+ANCHOR_CHUNK="${ANCHOR_CHUNK:-8}"   # anchors per TTT chunk (KV broadcast width); lower if OOM
 ARGMAX_CE="${ARGMAX_CE:-1.0}"
 SOFT_CE="${SOFT_CE:-0.0}"
 L1_WEIGHT="${L1_WEIGHT:-0.0}"   # only for rejection-sampling (temperature>0) setups
@@ -157,6 +158,7 @@ print(max(1, round(total * $WARMUP_RATIO)))
       --warmup-steps "$WARMUP_STEPS" \
       --ttt-steps "$TTT_STEPS" \
       --num-anchors "$NUM_ANCHORS" \
+      --anchor-chunk "$ANCHOR_CHUNK" \
       --argmax-ce-weight "$ARGMAX_CE" \
       --soft-ce-weight "$SOFT_CE" \
       --l1-weight "$L1_WEIGHT" \
