@@ -148,7 +148,7 @@ def _assistant_step(assistant, target_embed, normalizer, token_ids, hidden,
     return out.logits, out.last_hidden_state
 
 
-def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
+def _step_loss(draft_logits, target_hidden, target_lm_head, hard_targets, mask, cfg):
     """Distillation loss at one aligned draft step. Combines:
 
       - soft-CE (KL to target)          weight cfg.soft_ce_weight
@@ -163,8 +163,11 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
     DSpark uses 0.9*L1 + 0.1*CE. We report a differentiable accept_rate metric
     (1 - 0.5*L1) so training can be monitored against the quantity we care about.
 
-    Memory: vocab is 262144, so the (n_sup, V) softmax is chunked over rows to
-    bound peak memory (mean = sum / n_sup, numerically identical).
+    Memory: target logits are computed ONLY on supervised rows (gather the
+    (n_sup, H) hidden first, then lm_head), never the full (B, L, 262144) — that
+    full materialization was the OOM. Both target and draft are then chunked
+    over rows so peak memory is bounded regardless of how many tokens a batch
+    supervises (mean = sum / n_sup, numerically identical).
     """
     import torch
     import torch.nn.functional as F
@@ -172,6 +175,7 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
     temp = cfg.temperature
     l1_weight = float(getattr(cfg, "l1_weight", 0.0))
     B, L, V = draft_logits.shape
+    H = target_hidden.shape[-1]
     flat_mask = mask.reshape(-1).bool()                        # (B*L,)
     n_sup = int(flat_mask.sum())
     if n_sup == 0:
@@ -180,7 +184,9 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
         return z, {"soft_ce": z.detach()}
 
     d_flat = draft_logits.reshape(-1, V)[flat_mask]            # (n_sup, V)
-    t_flat = target_logits.reshape(-1, V)[flat_mask]           # (n_sup, V)
+    # Gather supervised hidden rows FIRST (n_sup, H) — small — then compute
+    # target logits per-chunk below. Never materialize (B, L, V) target logits.
+    th_flat = target_hidden.reshape(-1, H)[flat_mask]          # (n_sup, H)
     if cfg.hard_ce_weight > 0:
         ht_flat = hard_targets.reshape(-1)[flat_mask]          # (n_sup,)
 
@@ -192,7 +198,9 @@ def _step_loss(draft_logits, target_logits, hard_targets, mask, cfg):
     l1_sum = draft_logits.new_zeros(())
     for start in range(0, n_sup, chunk):
         d = d_flat[start:start + chunk]                        # (c, V)
-        t = t_flat[start:start + chunk]                        # (c, V)
+        # target logits for this chunk only — (c, H) @ lm_head -> (c, V).
+        with torch.no_grad():
+            t = target_lm_head(th_flat[start:start + chunk])   # (c, V)
         with torch.no_grad():
             soft_t = F.softmax(t / temp, dim=-1)
         log_p = F.log_softmax(d / temp, dim=-1)
@@ -238,13 +246,12 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
     loss_mask = batch["loss_mask"]
     B, T = input_ids.shape
 
-    _, _, target_embed, normalizer = locate_target_parts(target)
+    target_base, target_lm_head, target_embed, normalizer = locate_target_parts(target)
 
     with torch.no_grad():
         signals = build_target_signals(target, input_ids, attention_mask)
     target_last_hidden = signals["last_hidden"]        # (B, T, H)
     shared_kv_states = signals["shared_kv_states"]
-    target_logits = signals["target_logits"]           # (B, T, V)
 
     weights = compute_step_weights(cfg)
     K = cfg.ttt_steps
@@ -254,7 +261,7 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
 
     # Recurrent hidden fed to the draft; starts as the target's last hidden.
     hidden = target_last_hidden                        # (B, T, H) indexed by t
-    prev_draft_logits = None      # step k-1's draft logits, for the fed-back token
+    prev_draft_tokens = None      # step k-1's argmax token ids (B, L_prev), tiny
 
     for k in range(K):
         # At step k, position t consumes token[t+k] and predicts token[t+k+1].
@@ -269,30 +276,34 @@ def training_step(target, assistant, batch, cfg: MTPLossConfig):
         else:
             # Steps k>0 consume the DRAFT's OWN previous prediction (vLLM
             # llm_base_proposer.py:574), not ground truth. prev argmax at
-            # position j aligns with what position j consumes now; detach so the
-            # token branch is straight-through (recurrent hidden keeps grad).
-            token_ids_k = prev_draft_logits[:, :L, :].argmax(dim=-1).detach()
+            # position j aligns with what position j consumes now. Keep only the
+            # (B, L) token ids so the big (B, L, V) logits free after each step.
+            token_ids_k = prev_draft_tokens[:, :L]
         hidden_k = hidden[:, :L, :]                               # (B, L, H)
 
         draft_logits, backbone_hidden = _assistant_step(
             assistant, target_embed, normalizer,
             token_ids_k, hidden_k, shared_kv_states, None,
         )                                                        # (B, L, V), (B, L, H)
-        prev_draft_logits = draft_logits
+        prev_draft_tokens = draft_logits.argmax(dim=-1).detach()
 
-        # Supervision: draft_logits[:, t] should predict token[t+k+1] with the
-        # target's distribution at position t+k.
-        tgt_logits_k = target_logits[:, k:k + L, :]               # (B, L, V)
+        # Supervision: target's distribution at positions [k, k+L). Pass the
+        # hidden slice; _step_loss computes target logits only on masked rows.
+        tgt_hidden_k = target_last_hidden[:, k:k + L, :]          # (B, L, H)
         hard_targets_k = input_ids[:, k + 1:k + 1 + L]            # (B, L)
         mask_k = loss_mask[:, k + 1:k + 1 + L]                    # (B, L)
 
         step_loss, step_metrics = _step_loss(
-            draft_logits, tgt_logits_k, hard_targets_k, mask_k, cfg,
+            draft_logits, tgt_hidden_k, target_lm_head,
+            hard_targets_k, mask_k, cfg,
         )
         total_loss = total_loss + weights[k] * step_loss
         metrics[f"step{k}_soft_ce"] = step_metrics["soft_ce"]
         if "hard_ce" in step_metrics:
             metrics[f"step{k}_hard_ce"] = step_metrics["hard_ce"]
+        if "l1" in step_metrics:
+            metrics[f"step{k}_l1"] = step_metrics["l1"]
+            metrics[f"step{k}_accept"] = step_metrics["accept_rate"]
 
         # Recurrent feedback: next step consumes this step's backbone hidden.
         # backbone_hidden is indexed by t (query position); pad back to full T
@@ -330,7 +341,7 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     total_loss = torch.zeros((), device=input_ids.device)
     metrics: dict[str, object] = {}
     hidden = last_hidden
-    prev_draft_logits = None      # step k-1's draft logits, for the fed-back token
+    prev_draft_tokens = None      # step k-1's argmax token ids (B, L_prev), tiny
 
     for k in range(K):
         L = T - k - 1
@@ -344,32 +355,34 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             # Steps k>0 consume the DRAFT's OWN previous prediction, matching
             # vLLM inference (llm_base_proposer.py:574) — not ground truth.
             # Position j at step k-1 predicts the token position j consumes at
-            # step k, so prev argmax sliced to this step's shorter window aligns
-            # exactly. Detached: token branch is straight-through (no grad), the
-            # recurrent hidden branch below still carries gradient.
-            token_ids_k = prev_draft_logits[:, :L, :].argmax(dim=-1).detach()
+            # step k, so the prev argmax sliced to this step's shorter window
+            # aligns. We keep only the argmax token ids (B, L) from the previous
+            # step — NOT the full (B, L, V) logits — so the big logits tensor is
+            # freed after its loss each step (avoids TTT-depth OOM).
+            token_ids_k = prev_draft_tokens[:, :L]
         hidden_k = hidden[:, :L, :]
         draft_logits, backbone_hidden = _assistant_step(
             assistant, target_embed, None, token_ids_k, hidden_k,
             shared_kv_states, None)
-        prev_draft_logits = draft_logits
+        prev_draft_tokens = draft_logits.argmax(dim=-1).detach()
         hard_targets_k = input_ids[:, k + 1:k + 1 + L]
         mask_k = loss_mask[:, k + 1:k + 1 + L]
 
-        # Target soft labels: lm_head over the TARGET's cached hidden at the
-        # supervised positions [k, k+L) — NOT the recurrent draft hidden. This
-        # mirrors the online path (target_logits[:, k:k+L]). Cheap frozen matmul;
-        # _step_loss then gathers mask==1 rows.
-        with torch.no_grad():
-            tgt_hidden_k = last_hidden[:, k:k + L, :]              # (B, L, H)
-            tgt_logits_k = target_lm_head(tgt_hidden_k)           # (B, L, V)
+        # Target soft labels come from lm_head over the TARGET's cached hidden
+        # at the supervised positions [k, k+L). We pass the hidden slice (not
+        # full logits) so _step_loss computes target logits ONLY on masked rows.
+        tgt_hidden_k = last_hidden[:, k:k + L, :]                  # (B, L, H)
 
         step_loss, sm = _step_loss(
-            draft_logits, tgt_logits_k, hard_targets_k, mask_k, cfg)
+            draft_logits, tgt_hidden_k, target_lm_head,
+            hard_targets_k, mask_k, cfg)
         total_loss = total_loss + weights[k] * step_loss
         metrics[f"step{k}_soft_ce"] = sm["soft_ce"]
         if "hard_ce" in sm:
             metrics[f"step{k}_hard_ce"] = sm["hard_ce"]
+        if "l1" in sm:
+            metrics[f"step{k}_l1"] = sm["l1"]
+            metrics[f"step{k}_accept"] = sm["accept_rate"]
 
         if k + 1 < K:
             pad = last_hidden[:, L:, :]
