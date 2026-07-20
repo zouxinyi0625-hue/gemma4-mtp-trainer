@@ -13,14 +13,14 @@
 # its output already exists, so you can resume.
 #
 # USAGE
-#   REGEN_DIR=/tmp/regen \
-#   DATA_DIR=/tmp/mtp_26b_data \
-#   OUT_DIR=/tmp/mtp_cache_26b \
-#   CKPT_DIR="$AZURE_ML_INPUT_ukwdata/maiprofile/checkpoints/mtp_26b/$(date +%Y%m%d_%H%M%S)" \
+#   # everything defaults to the mount ($MNT); just run it after regen:
 #   bash run_pipeline.sh
 #
+#   # relocate everything by overriding MNT, or set individual dirs:
+#   MNT=/some/mount/maiprofile bash run_pipeline.sh
+#
 #   # only one stage:
-#   STAGE=split ... bash run_pipeline.sh
+#   STAGE=split bash run_pipeline.sh
 set -euo pipefail
 
 # ---- models --------------------------------------------------------------
@@ -29,10 +29,14 @@ TARGET="${TARGET:-/tmp/models/gemma4/text_only}"
 ASSISTANT="${ASSISTANT:-/tmp/models/gemma4/assistant}"
 
 # ---- data paths ----------------------------------------------------------
-REGEN_DIR="${REGEN_DIR:-/tmp/regen}"          # per-layer *_regen.jsonl (from run_regen.sh)
-DATA_DIR="${DATA_DIR:-/tmp/mtp_26b_data}"     # split train/eval land here (local, fast)
-OUT_DIR="${OUT_DIR:-/tmp/mtp_cache_26b}"      # sharded target cache (local)
-CKPT_DIR="${CKPT_DIR:?set CKPT_DIR=/path/to/checkpoints (e.g. on the mount)}"
+# Mount root; override MNT to relocate everything. The mount is now fast enough
+# to read/write directly (no local scratch needed).
+MNT="${MNT:-$AZURE_ML_INPUT_ukwdata/maiprofile}"
+DATE="${DATE:-20260616}"
+REGEN_DIR="${REGEN_DIR:-$MNT/regen_26b/$DATE}"   # per-layer *_regen.jsonl (run_regen.sh output)
+DATA_DIR="${DATA_DIR:-$MNT/mtp_26b/split}"       # split train/eval land here
+OUT_DIR="${OUT_DIR:-$MNT/mtp_26b/cache}"         # sharded target cache
+CKPT_DIR="${CKPT_DIR:-$MNT/mtp_26b/checkpoints/$(date +%Y%m%d_%H%M%S)}"
 TRAIN_JSONL="$DATA_DIR/train_maiprofile_26b.jsonl"
 EVAL_JSONL="$DATA_DIR/eval_maiprofile_26b.jsonl"
 

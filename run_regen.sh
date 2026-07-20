@@ -22,6 +22,10 @@ ASSISTANT="${ASSISTANT:-google/gemma-4-26B-A4B-it-assistant}"  # MTP draft
 TOKENIZER="${TOKENIZER:-google/gemma-4-26B-A4B-it}"
 SERVED_NAME="${SERVED_NAME:-gemma4}"
 
+# ---- mount root (override MNT to relocate everything) ---------------------
+MNT="${MNT:-$AZURE_ML_INPUT_ukwdata/maiprofile}"
+DATE="${DATE:-20260616}"
+
 # ---- input/output: two modes ----------------------------------------------
 # MULTI-LAYER (one server launch, many layers):
 #   INPUT_DIR=/raw_data/20260616  OUTPUT_DIR=/tmp/regen  LAYERS="layer1_actual layer3_seasonality ..."
@@ -29,12 +33,10 @@ SERVED_NAME="${SERVED_NAME:-gemma4}"
 #      source_layer=<layer> per layer. LAYERS empty = every *.jsonl in INPUT_DIR.
 # SINGLE-FILE (back-compat):
 #   INPUT=/path/prompts.jsonl  OUTPUT=/path/regen.jsonl  [SOURCE_LAYER=...]
-INPUT_DIR="${INPUT_DIR:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-/tmp/regen}"   # LOCAL scratch (fast); each layer copied
-                                        # to FINAL_DIR on completion.
-FINAL_DIR="${FINAL_DIR:-}"              # mount dir to copy finished files into
-                                        # (optional). Sequential big-file copy,
-                                        # so a slow mount isn't hit per-row.
+INPUT_DIR="${INPUT_DIR:-$MNT/data/raw_data/$DATE}"     # raw prompts on the mount
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/regen}"   # LOCAL scratch (fast, per-row writes);
+                                        # each finished layer copied to FINAL_DIR.
+FINAL_DIR="${FINAL_DIR:-$MNT/regen_26b/$DATE}"   # mount dir for finished files
 LAYERS="${LAYERS:-}"
 INPUT="${INPUT:-}"
 OUTPUT="${OUTPUT:-}"
