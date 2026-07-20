@@ -37,6 +37,7 @@ SPEC_TOKENS="${SPEC_TOKENS:-5}"           # MTP k
 READY_TIMEOUT="${READY_TIMEOUT:-900}"
 SERVER_LOG_DIR="${SERVER_LOG_DIR:-regen_server_logs}"
 SOURCE_LAYER="${SOURCE_LAYER:-}"          # optional tag for build_split stats
+NUM_SAMPLES="${NUM_SAMPLES:-}"            # cap input rows (e.g. 1000 for a test); empty = all
 
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 
@@ -120,6 +121,8 @@ echo ""
 echo "=== all servers ready; running regen ==="
 SRC_ARG=()
 [[ -n "$SOURCE_LAYER" ]] && SRC_ARG=(--source-layer "$SOURCE_LAYER")
+NUM_ARG=()
+[[ -n "$NUM_SAMPLES" ]] && NUM_ARG=(--num-samples "$NUM_SAMPLES")
 
 python -m gemma4_mtp.regen \
   --model "$SERVED_NAME" \
@@ -131,7 +134,8 @@ python -m gemma4_mtp.regen \
   --top-p "$TOP_P" \
   --max-tokens "$MAX_TOKENS" \
   --resume \
-  "${SRC_ARG[@]}"
+  "${SRC_ARG[@]}" \
+  "${NUM_ARG[@]}"
 
 echo ""
 echo "=== regen done -> $OUTPUT ==="
