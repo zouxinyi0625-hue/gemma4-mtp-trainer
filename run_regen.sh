@@ -22,8 +22,22 @@ ASSISTANT="${ASSISTANT:-google/gemma-4-26B-A4B-it-assistant}"  # MTP draft
 TOKENIZER="${TOKENIZER:-google/gemma-4-26B-A4B-it}"
 SERVED_NAME="${SERVED_NAME:-gemma4}"
 
-INPUT="${INPUT:?set INPUT=/path/to/dspark_prompts.jsonl}"
-OUTPUT="${OUTPUT:?set OUTPUT=/path/to/regen_26b.jsonl}"
+# ---- input/output: two modes ----------------------------------------------
+# MULTI-LAYER (one server launch, many layers):
+#   INPUT_DIR=/raw_data/20260616  OUTPUT_DIR=/tmp/regen  LAYERS="layer1_actual layer3_seasonality ..."
+#   -> reads $INPUT_DIR/<layer>.jsonl, writes $OUTPUT_DIR/<layer>_regen.jsonl,
+#      source_layer=<layer> per layer. LAYERS empty = every *.jsonl in INPUT_DIR.
+# SINGLE-FILE (back-compat):
+#   INPUT=/path/prompts.jsonl  OUTPUT=/path/regen.jsonl  [SOURCE_LAYER=...]
+INPUT_DIR="${INPUT_DIR:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+LAYERS="${LAYERS:-}"
+INPUT="${INPUT:-}"
+OUTPUT="${OUTPUT:-}"
+if [[ -z "$INPUT_DIR" && -z "$INPUT" ]]; then
+  echo "set INPUT_DIR + OUTPUT_DIR (+LAYERS) for multi-layer, or INPUT + OUTPUT for one file" >&2
+  exit 1
+fi
 
 NGPU="${NGPU:-8}"
 BASE_PORT="${BASE_PORT:-8100}"
@@ -46,7 +60,11 @@ mkdir -p "$SERVER_LOG_DIR"
 echo "=== regen: $NGPU single-GPU servers (TP1, FP8, MTP k=$SPEC_TOKENS) ==="
 echo "  target=$TARGET"
 echo "  assistant(MTP)=$ASSISTANT"
-echo "  input=$INPUT  output=$OUTPUT"
+if [[ -n "$INPUT_DIR" ]]; then
+  echo "  input_dir=$INPUT_DIR  output_dir=$OUTPUT_DIR  layers=${LAYERS:-<all *.jsonl>}"
+else
+  echo "  input=$INPUT  output=$OUTPUT"
+fi
 echo "  ports=$BASE_PORT..$((BASE_PORT+NGPU-1))  concurrency=$CONCURRENCY/server"
 echo ""
 
@@ -116,26 +134,61 @@ for ((i=0; i<NGPU; i++)); do
   fi
 done
 
-# ---- run regen across all servers -----------------------------------------
+# ---- run regen across all servers (loop over layers, servers stay up) ------
 echo ""
 echo "=== all servers ready; running regen ==="
-SRC_ARG=()
-[[ -n "$SOURCE_LAYER" ]] && SRC_ARG=(--source-layer "$SOURCE_LAYER")
 NUM_ARG=()
 [[ -n "$NUM_SAMPLES" ]] && NUM_ARG=(--num-samples "$NUM_SAMPLES")
 
-python -m gemma4_mtp.regen \
-  --model "$SERVED_NAME" \
-  --server "${SERVERS[@]}" \
-  --input "$INPUT" \
-  --output "$OUTPUT" \
-  --concurrency "$CONCURRENCY" \
-  --temperature "$TEMPERATURE" \
-  --top-p "$TOP_P" \
-  --max-tokens "$MAX_TOKENS" \
-  --resume \
-  "${SRC_ARG[@]}" \
-  "${NUM_ARG[@]}"
+run_one() {  # $1=input file  $2=output file  $3=source_layer(optional)
+  local in="$1" out="$2" layer="${3:-}"
+  local src=()
+  [[ -n "$layer" ]] && src=(--source-layer "$layer")
+  echo ""
+  echo "--- regen: ${layer:-$(basename "$in")}  ($in -> $out) ---"
+  mkdir -p "$(dirname "$out")"
+  python -m gemma4_mtp.regen \
+    --model "$SERVED_NAME" \
+    --server "${SERVERS[@]}" \
+    --input "$in" \
+    --output "$out" \
+    --concurrency "$CONCURRENCY" \
+    --temperature "$TEMPERATURE" \
+    --top-p "$TOP_P" \
+    --max-tokens "$MAX_TOKENS" \
+    --resume \
+    "${src[@]}" \
+    "${NUM_ARG[@]}"
+}
 
-echo ""
-echo "=== regen done -> $OUTPUT ==="
+if [[ -n "$INPUT_DIR" ]]; then
+  # multi-layer: LAYERS list, or every *.jsonl in INPUT_DIR
+  if [[ -z "$LAYERS" ]]; then
+    LAYERS=""
+    for f in "$INPUT_DIR"/*.jsonl; do
+      [[ -e "$f" ]] || continue
+      LAYERS+=" $(basename "$f" .jsonl)"
+    done
+  fi
+  echo "  layers:$LAYERS"
+  for layer in $LAYERS; do
+    in="$INPUT_DIR/${layer}.jsonl"
+    if [[ ! -f "$in" ]]; then
+      echo "  [skip] no input file: $in"
+      continue
+    fi
+    # skip empty files (e.g. layer2_merge)
+    if [[ ! -s "$in" ]]; then
+      echo "  [skip] empty file: $in"
+      continue
+    fi
+    run_one "$in" "$OUTPUT_DIR/${layer}_regen.jsonl" "$layer"
+  done
+  echo ""
+  echo "=== regen done -> $OUTPUT_DIR/<layer>_regen.jsonl ==="
+else
+  # single-file back-compat
+  run_one "$INPUT" "$OUTPUT" "$SOURCE_LAYER"
+  echo ""
+  echo "=== regen done -> $OUTPUT ==="
+fi
