@@ -198,6 +198,17 @@ def main():
     submitted = 0
     total_inflight = args.concurrency * len(clients)
 
+    # progress bar target = rows we'll actually process this run
+    if args.num_samples is not None:
+        target = min(args.num_samples, max(total - skip, 0))
+    else:
+        target = max(total - skip, 0)
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=target, desc="regen", unit="row")
+    except ImportError:
+        pbar = None
+
     with (
         open(args.input, "r", encoding="utf-8") as fin,
         open(args.output, mode, encoding="utf-8") as fout,
@@ -223,6 +234,9 @@ def main():
                         n_err += 1
                     inflight.remove(fut)
                     progressed = True
+                    if pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix(ok=n_ok, err=n_err, refresh=False)
             if block and not progressed:
                 time.sleep(0.05)
 
@@ -238,12 +252,12 @@ def main():
             client = clients[submitted % len(clients)]   # round-robin GPUs
             inflight.append(pool.submit(regen_one, client, args, sample))
             submitted += 1
-            if submitted % 100 == 0:
-                print(f"  submitted={submitted} ok={n_ok} err={n_err}", flush=True)
 
         while inflight:
             drain(block=True)
 
+    if pbar is not None:
+        pbar.close()
     print("=== done ===")
     print(f"  success={n_ok}  errors={n_err}  (errors -> {error_path})")
 
