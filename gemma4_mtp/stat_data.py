@@ -20,7 +20,7 @@ USAGE (on the server; the mount env var expands to the AzureML input path):
 
   # explicit dir or file(s):
   python -m gemma4_mtp.stat_data --path /some/dir_or_file.jsonl
-  python -m gemma4_mtp.stat_data --path "$AZURE_ML_INPUT_msndni/shares/users/xinyizou/maiprofile/data/raw_data/20260616"
+  python -m gemma4_mtp.stat_data --path "$AZURE_ML_INPUT_ukwdata/maiprofile/data/raw_data/20260616"
 
   # optional: exact token counts with a tokenizer (slower)
   python -m gemma4_mtp.stat_data --tokenizer /tmp/models/gemma4/text_only
@@ -36,13 +36,10 @@ from pathlib import Path
 
 
 def default_dir() -> str | None:
-    mount = os.environ.get("AZURE_ML_INPUT_msndni")
+    mount = os.environ.get("AZURE_ML_INPUT_ukwdata")
     if not mount:
         return None
-    return str(
-        Path(mount)
-        / "shares/users/xinyizou/maiprofile/data/raw_data/20260616"
-    )
+    return str(Path(mount) / "maiprofile/data/raw_data/20260616")
 
 
 def parse_args():
@@ -50,8 +47,7 @@ def parse_args():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--path", default=None,
                     help="raw-data dir or JSONL file. Default: "
-                         "$AZURE_ML_INPUT_msndni/shares/users/xinyizou/maiprofile/"
-                         "data/raw_data/20260616")
+                         "$AZURE_ML_INPUT_ukwdata/maiprofile/data/raw_data/20260616")
     ap.add_argument("--glob", default="*.jsonl",
                     help="glob for JSONL files when --path is a dir (default *.jsonl)")
     ap.add_argument("--tokenizer", default=None,
@@ -91,7 +87,7 @@ def main():
     path = args.path or default_dir()
     if not path:
         raise SystemExit(
-            "no --path and AZURE_ML_INPUT_msndni not set; pass --path explicitly")
+            "no --path and AZURE_ML_INPUT_ukwdata not set; pass --path explicitly")
     p = Path(path)
     if p.is_dir():
         files = sorted(p.glob(args.glob))
