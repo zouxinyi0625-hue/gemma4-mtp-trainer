@@ -111,7 +111,11 @@ def regen_one(client, args, sample):
     turns and splice in the model's answer. Returns the row with
     conversations replaced + status set (schema build_split.py expects).
     """
-    conversations = sample.get("conversations")
+    # Input conversation field varies: raw MAI Profile uses "prompt_messages"
+    # (system + user, prompt only); DSpark normalized uses "conversations".
+    conversations = (sample.get("prompt_messages")
+                     or sample.get("conversations")
+                     or sample.get("messages"))
     if not conversations:
         return _error_row(sample, "missing conversations")
     if conversations[0].get("role") == "assistant":
@@ -139,8 +143,16 @@ def regen_one(client, args, sample):
         })
 
     out = dict(sample)
+    out.pop("prompt_messages", None)   # replaced by "conversations" below
     out["conversations"] = regenerated
     out["status"] = "success"
+    # build_split routes by id = "{layer}:{prompt_hash}" (matches DSpark's split
+    # files). Construct it from source_layer + prompt_hash when not already set.
+    if "id" not in out and out.get("prompt_hash"):
+        if args.source_layer:
+            out["id"] = f"{args.source_layer}:{out['prompt_hash']}"
+        else:
+            out["id"] = out["prompt_hash"]
     if args.source_layer is not None and "source_layer" not in out:
         out["source_layer"] = args.source_layer
     return out
