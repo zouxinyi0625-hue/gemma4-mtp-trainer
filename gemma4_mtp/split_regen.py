@@ -21,9 +21,9 @@ OUTPUT (in --out-dir)
   (row schema unchanged: what gemma4_mtp.data expects.)
 
 USAGE
-  # dir of per-layer files, 5% eval, reproducible
+  # dir of per-layer files, 10% eval, reproducible
   python -m gemma4_mtp.split_regen \
-      --regen /tmp/regen --out-dir ./data/mtp_26b --eval-frac 0.05 --seed 0
+      --regen /tmp/regen --out-dir ./data/mtp_26b --eval-frac 0.1 --seed 0
 
   # single file, fixed eval count per layer
   python -m gemma4_mtp.split_regen \
@@ -45,8 +45,8 @@ def parse_args():
                     help="regen dir (<layer>_regen.jsonl files) or single JSONL")
     ap.add_argument("--out-dir", required=True, help="output dir for train/eval")
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument("--eval-frac", type=float, default=0.05,
-                     help="fraction of each layer held out for eval (default 0.05)")
+    grp.add_argument("--eval-frac", type=float, default=0.1,
+                     help="fraction of each layer held out for eval (default 0.1)")
     grp.add_argument("--eval-n", type=int, default=None,
                      help="fixed #eval rows per layer (overrides --eval-frac)")
     ap.add_argument("--seed", type=int, default=0, help="shuffle seed (reproducible)")
