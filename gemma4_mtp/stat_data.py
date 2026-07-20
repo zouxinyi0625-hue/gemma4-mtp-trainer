@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Statistics for MAI Profile raw-data JSONL (DSpark raw-data schema).
+"""Statistics for MAI Profile raw-data JSONL.
 
-Schema (per line, same as DSpark download_and_split.py output):
-    {"id": <int|str>, "conversations": [
-        {"role": "system"|"user"|"assistant", "content": "<str>"}, ...]}
+Handles both the RAW MAI Profile schema and DSpark's normalized schema:
+    raw:        {"user_id":..., "prompt_hash":..., "prompt_messages":[
+                    {"role": "system"|"user", "content": "<str>"}, ...]}
+                (prompt-only — no assistant answer yet; this is regen input)
+    normalized: {"id":..., "conversations":[{"role":..., "content":...}, ...]}
+
+The conversation field is auto-detected (prompt_messages / conversations /
+messages); id is prompt_hash or id.
 
 Reports, with a tqdm progress bar over lines:
   - files scanned, total rows, malformed rows (bad JSON / missing fields)
@@ -151,7 +156,12 @@ def main():
                     break
                 try:
                     row = json.loads(line)
-                    convs = row["conversations"]
+                    # Field name varies: raw MAI Profile uses "prompt_messages"
+                    # (prompt-only, no assistant answer yet); DSpark normalized
+                    # data uses "conversations"; some use "messages".
+                    convs = (row.get("prompt_messages")
+                             or row.get("conversations")
+                             or row.get("messages"))
                     assert isinstance(convs, list)
                 except Exception:
                     n_bad += 1
@@ -160,7 +170,8 @@ def main():
                     continue
 
                 n_rows += 1
-                rid = row.get("id")
+                # id varies: raw uses prompt_hash (+ user_id); normalized uses id.
+                rid = row.get("id") or row.get("prompt_hash")
                 if rid is not None:
                     if rid in id_seen:
                         dup_ids += 1
