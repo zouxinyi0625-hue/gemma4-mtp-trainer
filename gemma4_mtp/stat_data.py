@@ -59,7 +59,13 @@ def parse_args():
                     help="optional HF tokenizer path/id for exact token counts "
                          "(slower); if unset, uses whitespace word count as proxy")
     ap.add_argument("--max-rows", type=int, default=None,
-                    help="stop after N rows (debug)")
+                    help="stop after N rows per file (debug)")
+    ap.add_argument("--per-file", dest="per_file", action="store_true",
+                    default=None,
+                    help="report each file (layer) separately + a comparison "
+                         "table. Default: ON when scanning a dir of >1 files.")
+    ap.add_argument("--combined", dest="per_file", action="store_false",
+                    help="force a single combined report over all files.")
     return ap.parse_args()
 
 
@@ -68,6 +74,146 @@ def _pct(sorted_vals, q):
         return 0
     k = max(0, min(len(sorted_vals) - 1, int(round(q * (len(sorted_vals) - 1)))))
     return sorted_vals[k]
+
+
+def _new_stats():
+    return {
+        "n_rows": 0, "n_bad": 0, "empty_conv": 0, "first_not_user": 0,
+        "dup_ids": 0, "id_seen": set(),
+        "role_counts": Counter(), "first_role": Counter(),
+        "turns_per_row": [], "user_turns_per_row": [], "asst_turns_per_row": [],
+        "chars": {"system": [], "user": [], "assistant": [], "other": []},
+        "toks": {"system": [], "user": [], "assistant": [], "other": []},
+        "row_total_toks": [],
+    }
+
+
+def scan_file(path, count_tokens, pbar, st, max_rows=None):
+    """Accumulate stats for one JSONL file into st (see _new_stats)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if max_rows is not None and st["n_rows"] >= max_rows:
+                break
+            try:
+                row = json.loads(line)
+                # Field name varies: raw MAI Profile uses "prompt_messages"
+                # (prompt-only, no assistant answer yet); DSpark normalized data
+                # uses "conversations"; some use "messages".
+                convs = (row.get("prompt_messages")
+                         or row.get("conversations")
+                         or row.get("messages"))
+                assert isinstance(convs, list)
+            except Exception:
+                st["n_bad"] += 1
+                st["n_rows"] += 1
+                pbar.update(1)
+                continue
+
+            st["n_rows"] += 1
+            rid = row.get("id") or row.get("prompt_hash")
+            if rid is not None:
+                if rid in st["id_seen"]:
+                    st["dup_ids"] += 1
+                else:
+                    st["id_seen"].add(rid)
+
+            if not convs:
+                st["empty_conv"] += 1
+                st["turns_per_row"].append(0)
+                pbar.update(1)
+                continue
+
+            first = convs[0].get("role")
+            st["first_role"][first] += 1
+            if first != "user":
+                st["first_not_user"] += 1
+
+            nu = na = 0
+            row_toks = 0
+            for m in convs:
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                if not isinstance(content, str):
+                    content = str(content)
+                bucket = role if role in st["chars"] else "other"
+                st["role_counts"][role] += 1
+                st["chars"][bucket].append(len(content))
+                tlen = count_tokens(content)
+                st["toks"][bucket].append(tlen)
+                row_toks += tlen
+                if role == "user":
+                    nu += 1
+                elif role == "assistant":
+                    na += 1
+
+            st["turns_per_row"].append(len(convs))
+            st["user_turns_per_row"].append(nu)
+            st["asst_turns_per_row"].append(na)
+            st["row_total_toks"].append(row_toks)
+            pbar.update(1)
+    return st
+
+
+def report(st, unit, title=None):
+    if title:
+        print(f"\n########## {title} ##########")
+    print("\n=== ROWS ===")
+    print(f"  rows scanned      : {st['n_rows']:,}")
+    print(f"  malformed rows    : {st['n_bad']:,}")
+    print(f"  unique ids        : {len(st['id_seen']):,}  "
+          f"(duplicate ids: {st['dup_ids']:,})")
+    print(f"  empty conversation: {st['empty_conv']:,}")
+    print(f"  first role != user: {st['first_not_user']:,}")
+
+    print("\n=== ROLE COUNTS (messages) ===")
+    for role, c in st["role_counts"].most_common():
+        print(f"  {role:12s} {c:>12,}")
+
+    print("\n=== FIRST ROLE (per row) ===")
+    for role, c in st["first_role"].most_common():
+        print(f"  {role:12s} {c:>12,}")
+
+    print("\n=== TURNS PER ROW ===")
+    _summarize("messages/row", st["turns_per_row"])
+    _summarize("user turns/row", st["user_turns_per_row"])
+    _summarize("assistant turns/row", st["asst_turns_per_row"])
+
+    print(f"\n=== CONTENT LENGTH — chars ===")
+    for role in ("system", "user", "assistant", "other"):
+        _summarize(f"{role} chars", st["chars"][role])
+    print(f"\n=== CONTENT LENGTH — {unit} ===")
+    for role in ("system", "user", "assistant", "other"):
+        _summarize(f"{role} {unit}", st["toks"][role])
+    print(f"\n=== CONVERSATION TOTAL — {unit} ===")
+    _summarize(f"row total {unit}", st["row_total_toks"])
+
+
+def _p(vals, q):
+    if not vals:
+        return 0
+    return _pct(sorted(vals), q)
+
+
+def per_layer_summary(rows, unit):
+    """One-line-per-layer comparison table across layers."""
+    print(f"\n########## PER-LAYER SUMMARY ({unit}) ##########")
+    hdr = (f"{'layer':28s} {'rows':>9s} {'sys_'+unit[:4]:>9s} "
+           f"{'usr_p50':>8s} {'usr_p90':>8s} {'usr_p99':>8s} "
+           f"{'row_p50':>8s} {'row_p90':>8s} {'row_p99':>8s} {'row_max':>8s}")
+    print(hdr)
+    print("-" * len(hdr))
+    for name, st in rows:
+        sys_toks = st["toks"]["system"]
+        usr = st["toks"]["user"]
+        rt = st["row_total_toks"]
+        sysv = int(sum(sys_toks) / len(sys_toks)) if sys_toks else 0
+        print(f"{name:28s} {st['n_rows']:>9,} {sysv:>9,} "
+              f"{_p(usr,.5):>8,} {_p(usr,.9):>8,} {_p(usr,.99):>8,} "
+              f"{_p(rt,.5):>8,} {_p(rt,.9):>8,} {_p(rt,.99):>8,} {_p(rt,1.0):>8,}")
+
 
 
 def _summarize(name, vals):
@@ -113,10 +259,14 @@ def main():
             return len(tok.encode(text, add_special_tokens=False))
         return len(text.split())  # whitespace proxy
 
-    # total line count for the progress bar
+    # per-file (per-layer) unless forced combined; default ON for a dir of >1.
+    per_file = args.per_file
+    if per_file is None:
+        per_file = len(files) > 1
+
     print(f"=== MAI Profile raw-data stats ===")
     print(f"  path : {p}")
-    print(f"  files: {len(files)}")
+    print(f"  files: {len(files)}   mode: {'per-file (per-layer)' if per_file else 'combined'}")
     print("  counting lines for progress bar...", flush=True)
     total_lines = 0
     for f in files:
@@ -125,126 +275,26 @@ def main():
                 total_lines += 1
     print(f"  total lines: {total_lines:,}")
 
-    # accumulators
-    n_rows = 0
-    n_bad = 0
-    role_counts = Counter()
-    first_role = Counter()
-    turns_per_row = []          # #messages per conversation
-    user_turns_per_row = []
-    asst_turns_per_row = []
-    empty_conv = 0
-    first_not_user = 0
-    content_len_chars = {"system": [], "user": [], "assistant": [], "other": []}
-    content_len_toks = {"system": [], "user": [], "assistant": [], "other": []}
-    row_total_toks = []         # sum of tokens across a conversation
-    id_seen = set()
-    dup_ids = 0
-
-    pbar = tqdm(total=(args.max_rows or total_lines), desc="scanning", unit="row")
-    stop = False
-    for f in files:
-        if stop:
-            break
-        with open(f, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                if args.max_rows is not None and n_rows >= args.max_rows:
-                    stop = True
-                    break
-                try:
-                    row = json.loads(line)
-                    # Field name varies: raw MAI Profile uses "prompt_messages"
-                    # (prompt-only, no assistant answer yet); DSpark normalized
-                    # data uses "conversations"; some use "messages".
-                    convs = (row.get("prompt_messages")
-                             or row.get("conversations")
-                             or row.get("messages"))
-                    assert isinstance(convs, list)
-                except Exception:
-                    n_bad += 1
-                    n_rows += 1
-                    pbar.update(1)
-                    continue
-
-                n_rows += 1
-                # id varies: raw uses prompt_hash (+ user_id); normalized uses id.
-                rid = row.get("id") or row.get("prompt_hash")
-                if rid is not None:
-                    if rid in id_seen:
-                        dup_ids += 1
-                    else:
-                        id_seen.add(rid)
-
-                if not convs:
-                    empty_conv += 1
-                    turns_per_row.append(0)
-                    pbar.update(1)
-                    continue
-
-                first = convs[0].get("role")
-                first_role[first] += 1
-                if first != "user":
-                    first_not_user += 1
-
-                nu = na = 0
-                row_toks = 0
-                for m in convs:
-                    role = m.get("role", "?")
-                    content = m.get("content", "")
-                    if not isinstance(content, str):
-                        content = str(content)
-                    bucket = role if role in content_len_chars else "other"
-                    clen = len(content)
-                    tlen = count_tokens(content)
-                    role_counts[role] += 1
-                    content_len_chars[bucket].append(clen)
-                    content_len_toks[bucket].append(tlen)
-                    row_toks += tlen
-                    if role == "user":
-                        nu += 1
-                    elif role == "assistant":
-                        na += 1
-
-                turns_per_row.append(len(convs))
-                user_turns_per_row.append(nu)
-                asst_turns_per_row.append(na)
-                row_total_toks.append(row_toks)
-                pbar.update(1)
-    pbar.close()
-
-    # ---- report --------------------------------------------------------------
-    print("\n=== ROWS ===")
-    print(f"  rows scanned      : {n_rows:,}")
-    print(f"  malformed rows    : {n_bad:,}")
-    print(f"  unique ids        : {len(id_seen):,}  (duplicate ids: {dup_ids:,})")
-    print(f"  empty conversation: {empty_conv:,}")
-    print(f"  first role != user: {first_not_user:,}")
-
-    print("\n=== ROLE COUNTS (messages) ===")
-    for role, c in role_counts.most_common():
-        print(f"  {role:12s} {c:>12,}")
-
-    print("\n=== FIRST ROLE (per row) ===")
-    for role, c in first_role.most_common():
-        print(f"  {role:12s} {c:>12,}")
-
-    print("\n=== TURNS PER ROW ===")
-    _summarize("messages/row", turns_per_row)
-    _summarize("user turns/row", user_turns_per_row)
-    _summarize("assistant turns/row", asst_turns_per_row)
-
     unit = "tokens" if tok is not None else "words(proxy)"
-    print(f"\n=== CONTENT LENGTH — chars ===")
-    for role in ("system", "user", "assistant", "other"):
-        _summarize(f"{role} chars", content_len_chars[role])
-    print(f"\n=== CONTENT LENGTH — {unit} ===")
-    for role in ("system", "user", "assistant", "other"):
-        _summarize(f"{role} {unit}", content_len_toks[role])
-    print(f"\n=== CONVERSATION TOTAL — {unit} ===")
-    _summarize(f"row total {unit}", row_total_toks)
+    pbar = tqdm(total=(args.max_rows and args.max_rows * len(files)) or total_lines,
+                desc="scanning", unit="row")
+
+    if per_file:
+        per_layer = []
+        for f in files:
+            st = _new_stats()
+            scan_file(f, count_tokens, pbar, st, max_rows=args.max_rows)
+            layer = f.stem  # filename without .jsonl == layer name
+            report(st, unit, title=f"LAYER: {layer}  ({f.name})")
+            per_layer.append((layer, st))
+        pbar.close()
+        per_layer_summary(per_layer, unit)
+    else:
+        st = _new_stats()
+        for f in files:
+            scan_file(f, count_tokens, pbar, st, max_rows=args.max_rows)
+        pbar.close()
+        report(st, unit)
 
     print("\n(done)")
 
