@@ -497,8 +497,9 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
     per_step_rows = [0] * K
     with torch.no_grad():
         for k in range(K):
-            tgt_idx = (flat_anchor + k).clamp(max=T - 1)
-            step_valid = flat_keep & ((flat_anchor + k) < T) & \
+            # supervised position = anchor+k+1 (matches pass 2 / vLLM alignment)
+            tgt_idx = (flat_anchor + k + 1).clamp(max=T - 1)
+            step_valid = flat_keep & ((flat_anchor + k + 1) < T) & \
                 (loss_mask[batch_idx, tgt_idx] > 0)
             nk = int(step_valid.sum())
             per_step_rows[k] = nk
@@ -543,9 +544,19 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
                 for kt, kv in shared_kv_states.items()}       # (nc, Hkv, T, D)
         mask_c = (kv_pos <= c_anchor.unsqueeze(1)).to(last_hidden.dtype)  # (nc, T)
 
-        tok_k = input_ids[c_batch, c_anchor].unsqueeze(1)     # (nc, 1)
-        hid = last_hidden[c_batch, c_anchor].unsqueeze(1)     # (nc, 1, H)
-        pos = c_anchor.unsqueeze(1)                           # (nc, 1) FIXED
+        # step-0 input = t0 = the TARGET's argmax at the anchor (the token that
+        # vLLM feeds first), NOT input_ids[anchor]. vLLM drafting begins after
+        # the target has produced t0 at position anchor+1; the draft consumes t0
+        # (at position anchor+1) and predicts anchor+2 onward. Training on
+        # input_ids[anchor] instead shifted the whole token/target stream one
+        # slot earlier than inference — the off-by-one that made bench accept
+        # WORSE while the (mis-framed) training metric rose.
+        with torch.no_grad():
+            anchor_hidden = last_hidden[c_batch, c_anchor]        # (nc, H)
+            t0 = target_lm_head(anchor_hidden).argmax(dim=-1)     # (nc,) = t0
+        tok_k = t0.unsqueeze(1)                                   # (nc, 1)
+        hid = last_hidden[c_batch, c_anchor].unsqueeze(1)         # (nc, 1, H)
+        pos = (c_anchor + 1).clamp(max=T - 1).unsqueeze(1)       # (nc, 1) t0's position
 
         chunk_num = torch.zeros((), device=device)           # graph-attached, THIS chunk
         for k in range(K):
@@ -555,8 +566,13 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             tok_k = draft_logits.argmax(dim=-1).detach()      # (nc, 1) next input
             hid = backbone_hidden
 
-            tgt_idx = (c_anchor + k).clamp(max=T - 1)         # (nc,)
-            step_valid = c_keep & ((c_anchor + k) < T) & \
+            # Draft step k (having consumed t0 = token at anchor+1, then its own
+            # outputs) predicts the token at position anchor+k+2, so it is
+            # supervised by the target distribution that PREDICTS that token =
+            # lm_head(last_hidden[anchor+k+1]). This matches vLLM verification
+            # (draft[j] vs target greedy at base+j, base = t0's position).
+            tgt_idx = (c_anchor + k + 1).clamp(max=T - 1)     # (nc,)
+            step_valid = c_keep & ((c_anchor + k + 1) < T) & \
                 (loss_mask[c_batch, tgt_idx] > 0)
             nvalid = int(step_valid.sum())
             if nvalid == 0:
@@ -564,7 +580,7 @@ def training_step_from_cache(assistant, target_embed, target_lm_head, batch,
             rows = step_valid.nonzero(as_tuple=True)[0]
             d_rows = draft_logits[:, 0, :][rows]              # (n, V)
             th_rows = last_hidden[c_batch[rows], tgt_idx[rows]]  # (n, H)
-            gt_idx = (c_anchor + k + 1).clamp(max=T - 1)
+            gt_idx = (c_anchor + k + 2).clamp(max=T - 1)
             ht_rows = input_ids[c_batch[rows], gt_idx[rows]] \
                 if cfg.hard_ce_weight > 0 else None
 
