@@ -30,7 +30,11 @@ SERVED_NAME="${SERVED_NAME:-gemma4}"
 # SINGLE-FILE (back-compat):
 #   INPUT=/path/prompts.jsonl  OUTPUT=/path/regen.jsonl  [SOURCE_LAYER=...]
 INPUT_DIR="${INPUT_DIR:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/regen}"   # LOCAL scratch (fast); each layer copied
+                                        # to FINAL_DIR on completion.
+FINAL_DIR="${FINAL_DIR:-}"              # mount dir to copy finished files into
+                                        # (optional). Sequential big-file copy,
+                                        # so a slow mount isn't hit per-row.
 LAYERS="${LAYERS:-}"
 INPUT="${INPUT:-}"
 OUTPUT="${OUTPUT:-}"
@@ -171,6 +175,7 @@ if [[ -n "$INPUT_DIR" ]]; then
     done
   fi
   echo "  layers:$LAYERS"
+  [[ -n "$FINAL_DIR" ]] && mkdir -p "$FINAL_DIR" && echo "  final (mount): $FINAL_DIR"
   for layer in $LAYERS; do
     in="$INPUT_DIR/${layer}.jsonl"
     if [[ ! -f "$in" ]]; then
@@ -182,13 +187,25 @@ if [[ -n "$INPUT_DIR" ]]; then
       echo "  [skip] empty file: $in"
       continue
     fi
-    run_one "$in" "$OUTPUT_DIR/${layer}_regen.jsonl" "$layer"
+    out="$OUTPUT_DIR/${layer}_regen.jsonl"
+    run_one "$in" "$out" "$layer"
+    # copy this finished layer to the mount immediately (sequential big-file
+    # write; safe on slow mounts) so progress is durable per layer.
+    if [[ -n "$FINAL_DIR" && -f "$out" ]]; then
+      echo "  copying $out -> $FINAL_DIR/"
+      cp -f "$out" "$FINAL_DIR/" && echo "  copied ${layer}_regen.jsonl to mount"
+    fi
   done
   echo ""
   echo "=== regen done -> $OUTPUT_DIR/<layer>_regen.jsonl ==="
+  [[ -n "$FINAL_DIR" ]] && echo "=== copied to mount -> $FINAL_DIR/ ==="
 else
   # single-file back-compat
   run_one "$INPUT" "$OUTPUT" "$SOURCE_LAYER"
+  if [[ -n "$FINAL_DIR" && -f "$OUTPUT" ]]; then
+    mkdir -p "$FINAL_DIR"
+    cp -f "$OUTPUT" "$FINAL_DIR/" && echo "=== copied $(basename "$OUTPUT") to mount -> $FINAL_DIR/ ==="
+  fi
   echo ""
   echo "=== regen done -> $OUTPUT ==="
 fi
