@@ -87,7 +87,7 @@ echo ""
 # leftover server memory. Initial sleep, then poll; once regen is done we break
 # out and never loop again.
 WAIT_FOR_REGEN="${WAIT_FOR_REGEN:-1}"      # 0 to skip waiting (regen already done)
-WAIT_INITIAL="${WAIT_INITIAL:-7200}"       # 2h before the first check
+WAIT_INITIAL="${WAIT_INITIAL:-10800}"      # 3h before the first check
 WAIT_POLL="${WAIT_POLL:-1800}"             # then check every 30min
 WAIT_MAX="${WAIT_MAX:-86400}"              # give up after 24h (safety)
 
