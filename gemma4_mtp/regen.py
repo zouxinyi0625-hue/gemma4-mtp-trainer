@@ -209,6 +209,7 @@ def main():
     except ImportError:
         pbar = None
 
+    n_badline = 0
     with (
         open(args.input, "r", encoding="utf-8") as fin,
         open(args.output, mode, encoding="utf-8") as fout,
@@ -246,7 +247,15 @@ def main():
                 continue
             if args.num_samples is not None and submitted >= args.num_samples:
                 break
-            sample = json.loads(line)
+            try:
+                sample = json.loads(line)
+            except Exception:
+                # a malformed INPUT line (e.g. truncated JSON): skip it, don't
+                # let one bad row kill the whole run.
+                n_badline += 1
+                if pbar is not None:
+                    pbar.update(1)
+                continue
             while len(inflight) >= total_inflight:
                 drain(block=True)
             client = clients[submitted % len(clients)]   # round-robin GPUs
@@ -259,7 +268,8 @@ def main():
     if pbar is not None:
         pbar.close()
     print("=== done ===")
-    print(f"  success={n_ok}  errors={n_err}  (errors -> {error_path})")
+    print(f"  success={n_ok}  errors={n_err}  bad_input_lines={n_badline}  "
+          f"(errors -> {error_path})")
 
 
 if __name__ == "__main__":
