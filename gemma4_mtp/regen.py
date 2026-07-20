@@ -62,8 +62,10 @@ def parse_args():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True,
                     help="served model name (matches vllm serve --served-model-name)")
-    ap.add_argument("--server", required=True,
-                    help="OpenAI-compatible base URL, e.g. http://localhost:8100/v1")
+    ap.add_argument("--server", required=True, nargs="+",
+                    help="one or more OpenAI-compatible base URLs, e.g. "
+                         "http://localhost:8100/v1 http://localhost:8101/v1 ... "
+                         "Requests are round-robined across them (one per GPU).")
     ap.add_argument("--input", required=True,
                     help="DSpark prompt JSONL (rows with id + conversations)")
     ap.add_argument("--output", required=True, help="regen JSONL to write")
@@ -159,7 +161,9 @@ def main():
         raise SystemExit(
             "openai package required: pip install openai") from exc
 
-    client = OpenAI(base_url=args.server, api_key="none")
+    # One client per served endpoint; requests round-robin across them so all
+    # GPUs stay busy.
+    clients = [OpenAI(base_url=url, api_key="none") for url in args.server]
 
     total = _count_lines(args.input)
     skip = _count_lines(args.output) if args.resume else 0
@@ -169,10 +173,10 @@ def main():
         return
 
     print(f"=== regen via vLLM serve ===")
-    print(f"  model={args.model} server={args.server}")
+    print(f"  model={args.model}  servers={len(clients)}: {args.server}")
     print(f"  input={args.input} ({total} rows)  output={args.output}")
     print(f"  sampling: temp={args.temperature} top_p={args.top_p} "
-          f"max_tokens={args.max_tokens}  concurrency={args.concurrency}")
+          f"max_tokens={args.max_tokens}  concurrency={args.concurrency}/server")
     if skip:
         print(f"  resume: skipping first {skip} rows")
 
@@ -180,12 +184,13 @@ def main():
     n_ok = 0
     n_err = 0
     submitted = 0
+    total_inflight = args.concurrency * len(clients)
 
     with (
         open(args.input, "r", encoding="utf-8") as fin,
         open(args.output, mode, encoding="utf-8") as fout,
         open(error_path, mode, encoding="utf-8") as ferr,
-        ThreadPoolExecutor(max_workers=args.concurrency) as pool,
+        ThreadPoolExecutor(max_workers=total_inflight) as pool,
     ):
         for _ in range(skip):
             next(fin, None)
@@ -216,8 +221,9 @@ def main():
             if args.num_samples is not None and submitted >= args.num_samples:
                 break
             sample = json.loads(line)
-            while len(inflight) >= args.concurrency:
+            while len(inflight) >= total_inflight:
                 drain(block=True)
+            client = clients[submitted % len(clients)]   # round-robin GPUs
             inflight.append(pool.submit(regen_one, client, args, sample))
             submitted += 1
             if submitted % 100 == 0:
