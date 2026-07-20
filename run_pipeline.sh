@@ -81,7 +81,44 @@ echo "  num_anchors=$NUM_ANCHORS anchor_chunk=$ANCHOR_CHUNK gamma=$LOSS_DECAY_GA
 echo "  STAGE     = $STAGE"
 echo ""
 
-# ---- stage 1: split ------------------------------------------------------
+# ---- stage 0: wait for regen to finish, then free the GPUs ----------------
+# regen runs 8 `vllm serve` processes (run_regen.sh). We wait until NONE remain
+# (regen done), then kill any stragglers so cache/train don't OOM against
+# leftover server memory. Initial sleep, then poll; once regen is done we break
+# out and never loop again.
+WAIT_FOR_REGEN="${WAIT_FOR_REGEN:-1}"      # 0 to skip waiting (regen already done)
+WAIT_INITIAL="${WAIT_INITIAL:-7200}"       # 2h before the first check
+WAIT_POLL="${WAIT_POLL:-1800}"             # then check every 30min
+WAIT_MAX="${WAIT_MAX:-86400}"              # give up after 24h (safety)
+
+regen_running() { pgrep -f "vllm serve" >/dev/null 2>&1; }
+
+free_gpus() {
+  echo "  [gpu-clean] killing any vllm serve / stale GPU procs ..."
+  pkill -9 -f "vllm serve" 2>/dev/null || true
+  pkill -9 -f "gemma4_mtp.regen" 2>/dev/null || true
+  sleep 10   # let CUDA contexts tear down + memory free
+  command -v nvidia-smi >/dev/null 2>&1 && \
+    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader || true
+}
+
+if [[ "$WAIT_FOR_REGEN" == "1" && ( "$STAGE" == "all" || "$STAGE" == "split" || "$STAGE" == "cache" ) ]]; then
+  echo "=== [wait] regen gate: initial sleep ${WAIT_INITIAL}s, then poll every ${WAIT_POLL}s ==="
+  sleep "$WAIT_INITIAL"
+  waited="$WAIT_INITIAL"
+  while regen_running; do
+    if (( waited >= WAIT_MAX )); then
+      echo "!! [wait] regen still running after ${WAIT_MAX}s — giving up (set WAIT_FOR_REGEN=0 to skip)"; exit 1
+    fi
+    echo "  [wait] regen still running (vllm serve alive); sleeping ${WAIT_POLL}s (waited ${waited}s)"
+    sleep "$WAIT_POLL"
+    waited=$(( waited + WAIT_POLL ))
+  done
+  echo "=== [wait] regen finished (no vllm serve running). Freeing GPUs. ==="
+  free_gpus
+fi
+
+
 if [[ "$STAGE" == "all" || "$STAGE" == "split" ]]; then
   if [[ -f "$TRAIN_JSONL" && -f "$EVAL_JSONL" ]]; then
     echo "=== [split] SKIP: $TRAIN_JSONL already exists ==="
