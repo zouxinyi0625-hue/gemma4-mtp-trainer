@@ -88,6 +88,10 @@ def parse_args():
                          "mount reads) with GPU compute. 0 = main-thread reads.")
     ap.add_argument("--save-every", type=int, default=0,
                     help="save a checkpoint every N steps (0 = only at end)")
+    ap.add_argument("--save-epochs", action="store_true", default=True,
+                    help="save a checkpoint at each epoch end (output/epoch<N>); on by default")
+    ap.add_argument("--no-save-epochs", dest="save_epochs", action="store_false",
+                    help="disable per-epoch checkpoints")
     ap.add_argument("--max-steps", type=int, default=0,
                     help="stop after N steps (0 = full epochs); useful for a smoke test")
     return ap.parse_args()
@@ -453,6 +457,19 @@ def main():
                     if ddp:
                         dist.destroy_process_group()
                     return
+
+        # ---- end of epoch: save a checkpoint per epoch ----
+        # Barrier BEFORE the save (sync cheaply while ranks are idle), then
+        # rank0 writes alone; a barrier AFTER would make other ranks wait on
+        # the slow-mount save_pretrained and trip the NCCL watchdog.
+        if args.save_epochs:
+            if ddp:
+                dist.barrier()
+            if is_main:
+                _save(assistant_module, tokenizer,
+                      os.path.join(args.output, f"epoch{epoch}"))
+            if ddp:
+                dist.barrier()
 
     log("=== Done ===")
     if ddp:
