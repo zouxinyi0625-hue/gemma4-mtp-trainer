@@ -83,6 +83,9 @@ def parse_args():
     ap.add_argument("--bf16", action="store_true", help="load models in bfloat16")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--num-workers", type=int, default=4,
+                    help="DataLoader workers; >0 overlaps cache IO (sequential "
+                         "mount reads) with GPU compute. 0 = main-thread reads.")
     ap.add_argument("--save-every", type=int, default=0,
                     help="save a checkpoint every N steps (0 = only at end)")
     ap.add_argument("--max-steps", type=int, default=0,
@@ -127,6 +130,48 @@ def set_trainable(target, assistant):
     if n_train == 0:
         raise RuntimeError("no trainable params after freeze; check module names")
     return trainable
+
+
+class ShardOrderSampler:
+    """Sampler that reads the cache in SEQUENTIAL order (fast on a mount).
+
+    The cache index is dense and sorted by sample_id, so consecutive indices
+    are physically consecutive within a shard. Random global shuffle
+    (DistributedSampler(shuffle=True)) therefore triggers random reads across
+    68 GB shards on the mount, which is catastrophically slow (measured: random
+    stalls indefinitely; sequential = 475 MB/s). This sampler instead gives each
+    rank a CONTIGUOUS slice of indices so reads march through the shards
+    front-to-back at full mount bandwidth.
+
+    Randomness across epochs: the rank's contiguous window is rotated by an
+    epoch-dependent offset, so each epoch a rank trains on a different slice in
+    a different position. Within an epoch reads stay sequential (no per-sample
+    shuffle — that would reintroduce random reads). The data is already a
+    mixture of all layers from prepare_cache, so sequential order is not
+    degenerate for SGD.
+    """
+
+    def __init__(self, num_samples, num_replicas, rank, seed=0):
+        self.n = int(num_samples)
+        self.world = max(1, int(num_replicas))
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.per_rank = self.n // self.world  # drop remainder for even shape
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.per_rank
+
+    def __iter__(self):
+        # rank r, epoch e -> contiguous window starting at
+        # ((r + e) mod world) * per_rank, wrapping around the dataset. Different
+        # (r, e) => different contiguous slice, but each slice is sequential.
+        base = ((self.rank + self.epoch) % self.world) * self.per_rank
+        for i in range(self.per_rank):
+            yield (base + i) % self.n
 
 
 def main():
@@ -246,11 +291,21 @@ def main():
         collate_fn = lambda b: collate(b, pad_token_id=pad_id)
     if len(dataset) == 0:
         raise RuntimeError("empty dataset; check --data/--cache-dir")
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
-                                 shuffle=True) if ddp else None
+    if use_cache and ddp:
+        # Sequential-read sampler: random shuffle over 68 GB mount shards is
+        # catastrophically slow (see ShardOrderSampler / bench_cache). Each rank
+        # reads a contiguous slice front-to-back at full mount bandwidth.
+        sampler = ShardOrderSampler(len(dataset), num_replicas=world_size,
+                                    rank=rank)
+    elif ddp:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=True)
+    else:
+        sampler = None
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=(sampler is None),
         sampler=sampler, collate_fn=collate_fn,
+        num_workers=args.num_workers,
     )
 
     loss_cfg = MTPLossConfig(
