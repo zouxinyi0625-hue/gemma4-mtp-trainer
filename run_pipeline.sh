@@ -55,6 +55,7 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 TTT_STEPS="${TTT_STEPS:-5}"
 SAVE_EVERY="${SAVE_EVERY:-0}"
 LOG_EVERY="${LOG_EVERY:-1}"
+NUM_WORKERS="${NUM_WORKERS:-4}"   # DataLoader workers (overlap cache IO w/ compute)
 NUM_ANCHORS="${NUM_ANCHORS:-128}"
 ANCHOR_CHUNK="${ANCHOR_CHUNK:-8}"
 LOSS_DECAY_GAMMA="${LOSS_DECAY_GAMMA:-4.0}"
@@ -195,6 +196,6 @@ print(max(1, round(spe * $EPOCHS * $WARMUP_RATIO)))
       --hard-ce-weight "$HARD_CE" \
       --max-length "$MAX_LENGTH" \
       $SAVE_ARG \
-      --bf16 --log-every "$LOG_EVERY" 2>&1 | filter
+      --bf16 --log-every "$LOG_EVERY" --num-workers "$NUM_WORKERS" 2>&1 | filter
   echo "=== [train] done. checkpoint at $CKPT_DIR ==="
 fi
