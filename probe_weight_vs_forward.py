@@ -47,12 +47,22 @@ def main():
     ap.add_argument("--cache-dir", required=True)
     ap.add_argument("--num-scan", type=int, default=1000)
     ap.add_argument("--n-examples", type=int, default=300,
-                    help="anchors to score (one per row, first valid anchor)")
+                    help="total anchors to score (across rows)")
+    ap.add_argument("--anchors-per-row", type=int, default=4,
+                    help="random answer anchors sampled per row")
+    ap.add_argument("--skip-head", type=int, default=8,
+                    help="skip the first N valid anchors per row — they land on the "
+                         "chat-template header (<start_of_turn>model\\n), a fixed "
+                         "token transition every sample shares (t0=3723, tgt_next=107). "
+                         "Scoring those gives a meaningless 100%% hit. Real answer "
+                         "content starts after the header.")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--softcap", type=float, default=30.0,
                     help="target final_logit_softcapping (matches vLLM sampling)")
     args = ap.parse_args()
 
     import os
+    import random
     import torch
     from transformers import AutoModelForCausalLM
     from gemma4_mtp.target_cache import CacheDataset
@@ -83,6 +93,7 @@ def main():
 
     ds = CacheDataset(args.cache_dir)
     n = min(args.num_scan, len(ds))
+    rng = random.Random(args.seed)
 
     def step0(assistant, combined, shared, pos, mask):
         with torch.no_grad():
@@ -99,16 +110,21 @@ def main():
     tested = 0
 
     for i in range(n):
+        if tested >= args.n_examples:
+            break
         s = ds[i]
         T = s["input_ids"].shape[0]
         lm = s["loss_mask"].to(torch.bool)
         valid = lm[:-1] & lm[1:]
         pos_ids = torch.nonzero(valid).flatten()
+        # Skip the header anchors (first --skip-head valid positions land on the
+        # fixed chat-template transition); sample real answer-content anchors.
+        pos_ids = pos_ids[args.skip_head:]
+        pos_ids = pos_ids[pos_ids < T - 1]
         if pos_ids.numel() == 0:
             continue
-        a = int(pos_ids[0].item())
-        if a + 1 > T - 1:
-            continue
+        k = min(args.anchors_per_row, pos_ids.numel())
+        chosen = rng.sample(pos_ids.tolist(), k)
 
         last_hidden = s["last_hidden"].to(dev, dt)
         kv = {name: s[name].to(dev, dt).unsqueeze(0)
@@ -116,40 +132,42 @@ def main():
         shared = {"full_attention": (kv["kv_full_k"], kv["kv_full_v"]),
                   "sliding_attention": (kv["kv_slide_k"], kv["kv_slide_v"])}
         kv_pos = torch.arange(T, device=dev)
-        mask = (kv_pos <= a).to(dt).unsqueeze(0)
-        pos = torch.tensor([[min(a + 1, T - 1)]], device=dev)
 
-        with torch.no_grad():
-            # t0 = target argmax at anchor (what vLLM feeds); softcapped to match
-            ah = last_hidden[a]
-            t0 = softcap(target_lm_head(ah.unsqueeze(0)), args.softcap).argmax(-1)
-            emb = target_embed(t0.unsqueeze(0))              # (1,1,H) scaled inside
-            hid = last_hidden[a].view(1, 1, -1)
-            combined = torch.cat([emb, hid], dim=-1)
-            embed_norm_sum += emb.float().norm().item()
-            combined_norm_sum += combined.float().norm().item()
+        for a in chosen:
+            if tested >= args.n_examples:
+                break
+            mask = (kv_pos <= a).to(dt).unsqueeze(0)
+            pos = torch.tensor([[min(a + 1, T - 1)]], device=dev)
 
-            # accept reference = target argmax at position anchor+1 (what step0
-            # must predict), softcapped like vLLM.
-            tgt_next = softcap(
-                target_lm_head(last_hidden[a + 1].unsqueeze(0)), args.softcap).argmax(-1).item()
+            with torch.no_grad():
+                # t0 = target argmax at anchor (what vLLM feeds); softcapped.
+                ah = last_hidden[a]
+                t0 = softcap(target_lm_head(ah.unsqueeze(0)), args.softcap).argmax(-1)
+                emb = target_embed(t0.unsqueeze(0))          # (1,1,H) scaled inside
+                hid = last_hidden[a].view(1, 1, -1)
+                combined = torch.cat([emb, hid], dim=-1)
+                embed_norm_sum += emb.float().norm().item()
+                combined_norm_sum += combined.float().norm().item()
 
-        ls = step0(stock, combined, shared, pos, mask)
-        lt = step0(trained, combined, shared, pos, mask)
-        as_ = int(ls.argmax()); at_ = int(lt.argmax())
+                # accept reference = target argmax at position anchor+1.
+                tgt_next = softcap(
+                    target_lm_head(last_hidden[a + 1].unsqueeze(0)),
+                    args.softcap).argmax(-1).item()
 
-        sh = (as_ == tgt_next); th = (at_ == tgt_next)
-        stock_hit += sh; trained_hit += th
-        both += (sh and th)
-        stock_eq_trained += (as_ == at_)
-        tested += 1
+            ls = step0(stock, combined, shared, pos, mask)
+            lt = step0(trained, combined, shared, pos, mask)
+            as_ = int(ls.argmax()); at_ = int(lt.argmax())
 
-        if tested <= 8:
-            print(f"[{tested}] row={i} anchor={a} t0={int(t0.item())} "
-                  f"tgt_next={tgt_next}  stock_argmax={as_}({'hit' if sh else 'miss'})  "
-                  f"trained_argmax={at_}({'hit' if th else 'miss'})")
-        if tested >= args.n_examples:
-            break
+            sh = (as_ == tgt_next); th = (at_ == tgt_next)
+            stock_hit += sh; trained_hit += th
+            both += (sh and th)
+            stock_eq_trained += (as_ == at_)
+            tested += 1
+
+            if tested <= 12:
+                print(f"[{tested}] row={i} anchor={a} t0={int(t0.item())} "
+                      f"tgt_next={tgt_next}  stock={as_}({'hit' if sh else 'miss'})  "
+                      f"trained={at_}({'hit' if th else 'miss'})")
 
     print("\n==================== RESULTS ====================")
     print(f"  anchors scored: {tested}")
