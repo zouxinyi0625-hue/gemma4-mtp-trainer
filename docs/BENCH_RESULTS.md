@@ -68,6 +68,40 @@ layer4_biography             pos0=62.13 pos1=36.36 pos2=21.09 pos3=12.54 pos4=7.
 layer4_commercial_preference pos0=77.68 pos1=62.18 pos2=50.67 pos3=40.73 pos4=34.39
 ```
 
+## Bench #4 — uniform training (2026-07-24)
+
+Uniform training run, e011 MTP layer4_commercial_preference.
+Result file: `online_results/26b_e011_mtp_layer4_commercial_preference_online_20260724_015941.txt`
+Summary JSON: `maiprofile_26b_e011_mtp_online_summary.json`
+
+| layer                        | accept% | accept_len | out_tok/s |
+|------------------------------|:-------:|:----------:|:---------:|
+| layer3_seasonality           |  97.86  |    5.89    |  4859.3   |
+| layer3_commercial_interests  |  67.67  |    4.38    |  1940.6   |
+| layer1_actual                |  63.36  |    4.17    |  2108.1   |
+| layer4_commercial_preference |  55.25  |    3.76    |  2162.3   |
+| layer1_delta                 |  53.07  |    3.65    |  1183.9   |
+| layer2_coarse_interest       |  45.26  |    3.26    |  1808.8   |
+| layer1_intent                |  44.28  |    3.21    |  1924.1   |
+| layer2_temporal              |  40.41  |    3.02    |  1676.2   |
+| layer3_persona               |  38.52  |    2.93    |  1503.9   |
+| layer4_biography             |  29.03  |    2.45    |   225.6   |
+
+Per-position acceptance (%):
+
+```
+layer1_actual                pos0=84.59 pos1=71.78 pos2=61.18 pos3=53.36 pos4=45.87
+layer1_delta                 pos0=83.94 pos1=67.01 pos2=53.02 pos3=37.29 pos4=24.08
+layer1_intent                pos0=72.88 pos1=52.39 pos2=39.77 pos3=32.40 pos4=23.94
+layer2_coarse_interest       pos0=71.46 pos1=52.98 pos2=41.76 pos3=33.45 pos4=26.64
+layer2_temporal              pos0=70.08 pos1=48.98 pos2=36.86 pos3=27.51 pos4=18.63
+layer3_commercial_interests  pos0=87.25 pos1=76.50 pos2=67.17 pos3=58.12 pos4=49.34
+layer3_persona               pos0=69.25 pos1=47.32 pos2=33.51 pos3=25.72 pos4=16.77
+layer3_seasonality           pos0=99.22 pos1=98.84 pos2=98.32 pos3=97.09 pos4=95.85
+layer4_biography             pos0=63.61 pos1=37.81 pos2=22.72 pos3=13.45 pos4=7.56
+layer4_commercial_preference pos0=79.45 pos1=64.06 pos2=52.66 pos3=42.90 pos4=37.20
+```
+
 ## History (old eval split — NOT comparable to above; different dataset)
 
 | layer            | stock | #1 bug | #2 off-by-one fixed |
